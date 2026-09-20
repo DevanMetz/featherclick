@@ -191,17 +191,24 @@ to 1 ms for the duration of a run, because the default scheduler tick is
 interval held to 96–109 ms per click, and a 40–120 ms uniform setting produced
 40.3–120.3 ms with a flat distribution and mean 79.0 ms.
 
+**The rate ceiling.** Waking a sleeping thread costs the OS about a millisecond
+of granularity, so intervals below a few milliseconds do not run at the
+requested rate: asking for 1 ms measured 193 clicks/s. At that rate the loop
+used 3.1% of one core, and at 10 clicks/s the processor time was too small to
+measure at all.
+
 **Precision features are not decoration.** `stop-on-move`, the click counter and
 the elapsed timer are all sampled on the same loop as the clicks, so the limits
 stop the run within one interval, and a stop is never late by more than the
 25 ms slice length.
 
 **Lightness.** One process, one worker thread, an egui window that repaints only
-while a run is active or a countdown is on screen — an idle FeatherClick uses no
-measurable CPU. A release build is a single ~5.8 MB binary that links no system
-GUI toolkit, no web view and no scripting engine. Accessibility tree support is
-compiled out to keep the binary small, which means the UI is not exposed to
-screen readers.
+while a run is active or a countdown is on screen: 10 seconds of idle time
+measured 0.0000 s of processor time, and 100 clicks over 10 seconds also
+measured 0.0000 s. A release build is a single ~5.8 MB binary that links no
+system GUI toolkit, no web view and no scripting engine. Accessibility tree
+support is compiled out to keep the binary small, which means the UI is not
+exposed to screen readers.
 
 **State.** The engine snapshots your settings when a run starts, so a run cannot
 change shape halfway through. The UI writes settings to disk 400 ms after the
