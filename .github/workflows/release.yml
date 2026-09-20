@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $dist = "dist/featherclick-$env:GITHUB_REF_NAME-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item target/release/featherclick.exe $dist/
+          Copy-Item README.md, LICENSE $dist/
+          Compress-Archive -Path "$dist/*" -DestinationPath "$dist.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*.zip
+          if-no-files-found: error
+
+  linux:
+    name: Linux x86_64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev xvfb
+
+      - run: cargo build --release --locked
+
+      - name: Smoke test on a virtual display
+        run: |
+          xvfb-run -a ./target/release/featherclick --headless --clicks 5 --interval 20 --at 40,40 --quiet | tee smoke.txt
+          grep -q "5 clicks" smoke.txt
+          grep -q "click limit reached" smoke.txt
+
+      - name: Package
+        run: |
+          stage="dist/featherclick-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir -p "$stage"
+          cp target/release/featherclick "$stage/"
+          cp README.md LICENSE "$stage/"
+          cp assets/icon.png "$stage/featherclick.png"
+          cp assets/featherclick.desktop "$stage/"
+          tar -C dist -czf "$stage.tar.gz" "$(basename "$stage")"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --release --locked --target aarch64-apple-darwin
+      - run: cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Bundle
+        run: |
+          set -euo pipefail
+          lipo -create \
+            target/aarch64-apple-darwin/release/featherclick \
+            target/x86_64-apple-darwin/release/featherclick \
+            -output featherclick-universal
+          app="dist/FeatherClick.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp featherclick-universal "$app/Contents/MacOS/FeatherClick"
+          cp assets/icon.png "$app/Contents/Resources/featherclick.png"
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>FeatherClick</string>
+            <key>CFBundleDisplayName</key><string>FeatherClick</string>
+            <key>CFBundleIdentifier</key><string>com.github.devanmetz.featherclick</string>
+            <key>CFBundleExecutable</key><string>FeatherClick</string>
+            <key>CFBundleIconFile</key><string>featherclick</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${GITHUB_REF_NAME#v}</string>
+            <key>CFBundleVersion</key><string>${GITHUB_REF_NAME#v}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          # Ad-hoc signature: Gatekeeper still asks once, but this keeps the
+          # bundle internally consistent on both architectures.
+          codesign --force --sign - "$app" || true
+          cp README.md LICENSE dist/
+          (cd dist && zip -qry "featherclick-${GITHUB_REF_NAME}-macos-universal.zip" FeatherClick.app README.md LICENSE)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - run: ls -lh dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "FeatherClick $GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag

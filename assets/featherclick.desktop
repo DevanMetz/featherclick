@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=FeatherClick
+GenericName=Autoclicker
+Comment=Autoclick with human-like timing
+Exec=featherclick
+Icon=featherclick
+Terminal=false
+Categories=Utility;
+Keywords=click;autoclicker;mouse;macro;
+StartupWMClass=featherclick

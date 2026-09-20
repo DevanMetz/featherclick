@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: build, lint and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Linux build dependencies
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev xvfb
+
+      - name: Formatting
+        if: matrix.os == 'ubuntu-22.04'
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --all-targets
+
+      # Clicks into a virtual display: proves the input backend really connects
+      # and that limits stop the session on this platform.
+      - name: Engine smoke test (Xvfb)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          xvfb-run -a cargo run -- --headless --clicks 5 --interval 20 --at 40,40 --quiet | tee smoke.txt
+          grep -q "5 clicks" smoke.txt
+          grep -q "click limit reached" smoke.txt
