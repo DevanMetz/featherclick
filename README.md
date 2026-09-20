@@ -52,10 +52,11 @@ clicks are silently dropped by the system.
 
 ```sh
 tar -xzf featherclick-*-linux-x86_64.tar.gz
-install -Dm755 featherclick-linux-x86_64/featherclick ~/.local/bin/featherclick
+cd featherclick-*-linux-x86_64
+install -Dm755 featherclick ~/.local/bin/featherclick
 # optional desktop entry + icon
-install -Dm644 featherclick-linux-x86_64/featherclick.desktop ~/.local/share/applications/featherclick.desktop
-install -Dm644 featherclick-linux-x86_64/featherclick.png ~/.local/share/icons/hicolor/256x256/apps/featherclick.png
+install -Dm644 featherclick.desktop ~/.local/share/applications/featherclick.desktop
+install -Dm644 featherclick.png ~/.local/share/icons/hicolor/256x256/apps/featherclick.png
 ```
 
 ## Platform support
