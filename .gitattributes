@@ -1,0 +1,7 @@
+# Keep the repository contents LF so Linux and macOS checkouts behave the same
+# as the CI runners, whatever the local `core.autocrlf` is set to.
+* text=auto eol=lf
+
+*.ico binary
+*.png binary
+*.rgba binary
