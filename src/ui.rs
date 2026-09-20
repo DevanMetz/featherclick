@@ -294,7 +294,10 @@ impl App {
                 if running {
                     hints.push("changes apply on the next start".to_string());
                 } else if !self.settings.hotkey_toggle.trim().is_empty() {
-                    hints.push(format!("{} toggles", self.settings.hotkey_toggle));
+                    hints.push(format!(
+                        "{} toggles",
+                        hotkeys::pretty(&self.settings.hotkey_toggle)
+                    ));
                 }
                 ui.label(
                     RichText::new(hints.join("  ·  "))
@@ -566,7 +569,7 @@ impl App {
                     let text = match capturing {
                         Some(active) if active == target => "press a key…".to_string(),
                         _ if current.trim().is_empty() => "not set".to_string(),
-                        _ => current.clone(),
+                        _ => hotkeys::pretty(&current),
                     };
                     if ui.button(text).clicked() {
                         self.begin_capture(target);

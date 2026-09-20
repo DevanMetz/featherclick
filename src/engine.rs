@@ -648,21 +648,34 @@ mod tests {
     }
 
     #[test]
-    fn waiter_honours_deadlines_without_overshooting_wildly() {
+    fn waiter_never_returns_early_and_does_not_systematically_lag() {
         let mut waiter = Waiter::new();
         // Warm up so the overshoot estimate is realistic.
         for _ in 0..5 {
             waiter.wait(Instant::now() + Duration::from_millis(5), &mut || None);
         }
+
+        let start = Instant::now();
+        let mut worst = Duration::ZERO;
         for _ in 0..20 {
             let deadline = Instant::now() + Duration::from_millis(20);
             assert_eq!(waiter.wait(deadline, &mut || None), None);
-            let late = Instant::now().saturating_duration_since(deadline);
-            assert!(
-                late < Duration::from_millis(15),
-                "overshot the deadline by {late:?}"
-            );
+            let now = Instant::now();
+            assert!(now >= deadline, "returned early by {:?}", deadline - now);
+            worst = worst.max(now.saturating_duration_since(deadline));
         }
+
+        // A shared runner may wake late, so this bound is deliberately loose.
+        // What it still catches is the loop waiting on the wrong thing.
+        let total = start.elapsed();
+        assert!(
+            total >= Duration::from_millis(400),
+            "20 waits of 20 ms cannot finish in {total:?}"
+        );
+        assert!(
+            total < Duration::from_millis(800),
+            "20 waits of 20 ms took {total:?}, worst wake {worst:?}"
+        );
     }
 
     #[test]

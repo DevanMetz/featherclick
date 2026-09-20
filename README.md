@@ -62,15 +62,19 @@ install -Dm644 featherclick-linux-x86_64/featherclick.png ~/.local/share/icons/h
 
 | | Windows 10/11 | macOS 11+ | Linux (X11) | Linux (Wayland) |
 | --- | --- | --- | --- | --- |
-| Clicking | ✅ | ✅ (Accessibility permission) | ✅ | ✅ via portal / wlroots |
+| Clicking | ✅ | ✅ (Accessibility permission) | ✅ | ✅ wlroots only |
 | Global hotkeys | ✅ | ✅ | ✅ | ❌ — use the buttons |
 | Picking a position | ✅ | ✅ | ✅ | ✅ |
 
-On Wayland, clicking uses the compositor's RemoteDesktop portal (GNOME 46+,
-KDE 6+) or the wlroots virtual-pointer protocol (Sway, Hyprland). The
-compositor shows a one-time permission prompt. Where neither is available,
-clicks only reach XWayland applications. Wayland has no equivalent of X11's
-global grabs, so the hotkeys are unavailable there.
+On Wayland, clicking uses the compositor's virtual-pointer protocol, which
+wlroots-based compositors (Sway, Hyprland) provide. GNOME and KDE are not
+covered: their only input path is the RemoteDesktop portal, and the upstream
+portal client aborts the process when no portal is present, so it is
+deliberately not compiled in — a crash on launch is worse than a documented
+gap. On compositors without virtual-pointer support, clicks still reach
+XWayland applications. Wayland has no equivalent of X11's global grabs, so
+hotkeys are unavailable there and the on-screen buttons are the way to drive
+it.
 
 ## Using the window
 

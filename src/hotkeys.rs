@@ -78,6 +78,31 @@ impl Hotkeys {
     }
 }
 
+/// Renders a stored binding for display: the backends round-trip a canonical
+/// form like `shift+control+KeyK`, which is accurate but not what anyone wants
+/// to read in the UI.
+pub fn pretty(binding: &str) -> String {
+    let trimmed = binding.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    trimmed
+        .split('+')
+        .map(|part| match part.trim() {
+            "shift" => "Shift",
+            "control" => "Ctrl",
+            "alt" => "Alt",
+            "super" => "Super",
+            "meta" => "Meta",
+            other => other
+                .strip_prefix("Key")
+                .or_else(|| other.strip_prefix("Digit"))
+                .unwrap_or(other),
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
 /// `true` for the press transition only, so a held key fires once.
 pub fn is_press(event: &GlobalHotKeyEvent) -> bool {
     event.state == HotKeyState::Pressed
@@ -185,6 +210,21 @@ mod tests {
         assert!(!invalid("F6"));
         assert!(invalid("NotAKey"));
         assert!(!invalid("  "), "whitespace is treated as cleared");
+    }
+
+    #[test]
+    fn stored_bindings_display_readably() {
+        assert_eq!(pretty("F6"), "F6");
+        assert_eq!(pretty("shift+control+KeyK"), "Shift+Ctrl+K");
+        assert_eq!(pretty("alt+Digit1"), "Alt+1");
+        assert_eq!(pretty("super+Numpad0"), "Super+Numpad0");
+        assert_eq!(pretty(""), "");
+        // whatever the UI prints must still parse back into a working binding
+        let stored = "shift+control+KeyK";
+        assert_eq!(
+            parse(&pretty(stored)).map(|hotkey| hotkey.id()),
+            parse(stored).map(|h| h.id())
+        );
     }
 
     #[test]
