@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Manual runs build and package every platform but publish nothing, which is
+  # how a change to this workflow gets tested without burning a version number.
   workflow_dispatch:
 
 permissions:
@@ -17,7 +19,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
@@ -31,7 +33,7 @@ jobs:
           Copy-Item README.md, LICENSE $dist/
           Compress-Archive -Path "$dist/*" -DestinationPath "$dist.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: dist/*.zip
@@ -42,7 +44,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -71,7 +73,7 @@ jobs:
           cp assets/featherclick.desktop "$stage/"
           tar -C dist -czf "$stage.tar.gz" "$(basename "$stage")"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: dist/*.tar.gz
@@ -82,7 +84,7 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -126,7 +128,7 @@ jobs:
           cp README.md LICENSE dist/
           (cd dist && zip -qry "featherclick-${GITHUB_REF_NAME}-macos-universal.zip" FeatherClick.app README.md LICENSE)
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos
           path: dist/*.zip
@@ -134,11 +136,13 @@ jobs:
 
   publish:
     name: Publish release
+    # A manual run stops after packaging; only a tag publishes.
+    if: github.event_name == 'push'
     needs: [windows, linux, macos]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
