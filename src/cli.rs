@@ -16,9 +16,9 @@ FeatherClick - a tiny cross-platform autoclicker
 USAGE:
     featherclick [OPTIONS]
 
-With no options the settings window opens. Run options start clicking in the
-background, using the saved settings as defaults; a limit of 0 means run until
-interrupted.
+With no options the settings window opens. Any run option clicks without opening
+a window, using the saved settings as defaults. A limit of 0 means unlimited;
+passing --clicks or --seconds replaces both saved limits.
 
 RUN OPTIONS:
         --headless              click without opening a window
@@ -35,7 +35,8 @@ OTHER OPTIONS:
     -h, --help                  print this help
     -V, --version               print the version
 
-Exit status is 0 on success (including stop conditions), 1 on error.";
+Exit status is 0 on success (including stop conditions), 1 on a runtime error,
+and 2 for invalid arguments.";
 
 #[derive(Debug, Default)]
 pub struct Args {
@@ -157,6 +158,13 @@ fn number<T: std::str::FromStr>(raw: &str, flag: &str) -> Result<T, String> {
 
 impl Run {
     pub fn apply(&self, settings: &mut Settings) {
+        // An explicit limit replaces both saved limits. Otherwise, for example,
+        // `--seconds 30` could still be cut short by a saved click cap, or
+        // `--clicks 20` by a saved time cap.
+        if self.clicks.is_some() || self.seconds.is_some() {
+            settings.max_clicks = 0;
+            settings.max_seconds = 0;
+        }
         if let Some(clicks) = self.clicks {
             settings.max_clicks = clicks;
         }
@@ -278,4 +286,95 @@ fn describe(settings: &Settings) -> String {
         timing,
         place
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_args(raw: &[&str]) -> Result<Args, String> {
+        parse(raw.iter().map(|arg| arg.to_string()))
+    }
+
+    fn applied(saved: &Settings, raw: &[&str]) -> Settings {
+        let mut settings = saved.clone();
+        parse_args(raw).unwrap().run.unwrap().apply(&mut settings);
+        settings.sanitize();
+        settings
+    }
+
+    #[test]
+    fn values_work_in_both_separate_and_inline_forms() {
+        let args = parse_args(&[
+            "--headless",
+            "--clicks=12",
+            "--at",
+            "-5, 7",
+            "--button",
+            "RIGHT",
+            "--jitter",
+            "0",
+            "--quiet",
+        ])
+        .unwrap();
+        assert!(args.run.is_some());
+        let run = args.run.unwrap();
+        assert_eq!(run.clicks, Some(12));
+        assert_eq!(run.at, Some((-5, 7)));
+        assert_eq!(run.button, Some(MouseButton::Right));
+        assert_eq!(run.jitter_px, Some(0));
+        assert!(run.quiet);
+    }
+
+    #[test]
+    fn explicit_limits_replace_both_saved_limits() {
+        let saved = Settings {
+            max_clicks: 50,
+            max_seconds: 5,
+            ..Settings::default()
+        };
+
+        let seconds = applied(&saved, &["--seconds", "30"]);
+        assert_eq!(seconds.max_seconds, 30);
+        assert_eq!(
+            seconds.max_clicks, 0,
+            "a saved click cap must not cut the requested duration short"
+        );
+
+        let clicks = applied(&saved, &["--clicks", "20"]);
+        assert_eq!(clicks.max_clicks, 20);
+        assert_eq!(
+            clicks.max_seconds, 0,
+            "a saved time cap must not cut the requested click count short"
+        );
+
+        let both = applied(&saved, &["--clicks", "20", "--seconds", "30"]);
+        assert_eq!((both.max_clicks, both.max_seconds), (20, 30));
+
+        let unlimited = applied(&saved, &["--clicks", "0"]);
+        assert_eq!((unlimited.max_clicks, unlimited.max_seconds), (0, 0));
+    }
+
+    #[test]
+    fn limits_left_alone_keep_the_saved_values() {
+        let saved = Settings {
+            max_clicks: 50,
+            max_seconds: 5,
+            ..Settings::default()
+        };
+        let run = applied(&saved, &["--interval", "10"]);
+        assert_eq!((run.max_clicks, run.max_seconds), (50, 5));
+    }
+
+    #[test]
+    fn malformed_values_name_the_option() {
+        let error = parse_args(&["--clicks", "many"]).unwrap_err();
+        assert!(error.contains("--clicks wants a number"), "{error}");
+
+        let error = parse_args(&["--at", "10"]).unwrap_err();
+        assert!(error.contains("--at wants X,Y"), "{error}");
+
+        let error = parse_args(&["--button", "side"]).unwrap_err();
+        assert!(error.contains("unknown button: side"), "{error}");
+    }
 }

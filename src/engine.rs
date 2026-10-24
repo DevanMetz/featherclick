@@ -272,6 +272,32 @@ fn poll(rx: &Receiver<Command>, enigo: &mut Enigo, sink: &mut dyn FnMut(SessionE
     }
 }
 
+/// Checks the session limits plus pending commands. Called before every sleep
+/// slice, so a long interval cannot postpone either kind of stop.
+fn stop_check(
+    settings: &Settings,
+    started: Instant,
+    rx: &Receiver<Command>,
+    enigo: &mut Enigo,
+    sink: &mut dyn FnMut(SessionEvent),
+) -> Option<StopReason> {
+    if time_limit_reached(settings, started.elapsed()) {
+        return Some(StopReason::TimeLimit);
+    }
+    match poll(rx, enigo, sink) {
+        Polled::Continue => None,
+        Polled::Stop(reason) => Some(reason),
+    }
+}
+
+fn click_limit_reached(settings: &Settings, clicks: u64) -> bool {
+    settings.max_clicks > 0 && clicks >= settings.max_clicks
+}
+
+fn time_limit_reached(settings: &Settings, elapsed: Duration) -> bool {
+    settings.max_seconds > 0 && elapsed >= Duration::from_secs(settings.max_seconds as u64)
+}
+
 /// Runs one clicking session to completion. Blocks until a limit is hit or a
 /// stop command arrives.
 pub(crate) fn run_session(
@@ -291,9 +317,8 @@ pub(crate) fn run_session(
     // Give the user time to move the pointer into place before the anchor is taken.
     if settings.start_delay_ms > 0 {
         let deadline = started + Duration::from_millis(settings.start_delay_ms as u64);
-        if let Some(stopped) = waiter.wait(deadline, &mut || match poll(rx, enigo, sink) {
-            Polled::Continue => None,
-            Polled::Stop(reason) => Some(reason),
+        if let Some(stopped) = waiter.wait(deadline, &mut || {
+            stop_check(settings, started, rx, enigo, sink)
         }) {
             reason = Some(stopped);
         }
@@ -308,13 +333,11 @@ pub(crate) fn run_session(
 
     let mut next = Instant::now();
     while reason.is_none() {
-        if settings.max_clicks > 0 && clicks >= settings.max_clicks {
+        if click_limit_reached(settings, clicks) {
             reason = Some(StopReason::ClickLimit);
             break;
         }
-        if settings.max_seconds > 0
-            && started.elapsed() >= Duration::from_secs(settings.max_seconds as u64)
-        {
+        if time_limit_reached(settings, started.elapsed()) {
             reason = Some(StopReason::TimeLimit);
             break;
         }
@@ -327,6 +350,13 @@ pub(crate) fn run_session(
         }
         clicks += presses_per_trigger(settings.style);
         sink(SessionEvent::Trigger(clicks));
+
+        // Do not sleep a whole interval after the final click just to notice
+        // that the cap was reached.
+        if click_limit_reached(settings, clicks) {
+            reason = Some(StopReason::ClickLimit);
+            break;
+        }
 
         if settings.stop_on_move_px > 0 {
             let moved = enigo
@@ -346,10 +376,9 @@ pub(crate) fn run_session(
             // than firing a burst to catch up.
             next = now;
         }
-        if let Some(stopped) = waiter.wait(next, &mut || match poll(rx, enigo, sink) {
-            Polled::Continue => None,
-            Polled::Stop(reason) => Some(reason),
-        }) {
+        if let Some(stopped) =
+            waiter.wait(next, &mut || stop_check(settings, started, rx, enigo, sink))
+        {
             reason = Some(stopped);
         }
     }
@@ -645,6 +674,29 @@ mod tests {
         assert_eq!(presses_per_trigger(ClickStyle::Single), 1);
         assert_eq!(presses_per_trigger(ClickStyle::Double), 2);
         assert_eq!(presses_per_trigger(ClickStyle::Hold), 1);
+    }
+
+    #[test]
+    fn click_limit_is_inclusive_and_zero_means_unlimited() {
+        let mut s = settings();
+        assert!(!click_limit_reached(&s, 0));
+        assert!(!click_limit_reached(&s, u64::MAX));
+
+        s.max_clicks = 1;
+        assert!(!click_limit_reached(&s, 0));
+        assert!(click_limit_reached(&s, 1));
+        assert!(click_limit_reached(&s, 2));
+    }
+
+    #[test]
+    fn time_limit_is_inclusive_and_zero_means_unlimited() {
+        let mut s = settings();
+        assert!(!time_limit_reached(&s, Duration::from_secs(86_400)));
+
+        s.max_seconds = 2;
+        assert!(!time_limit_reached(&s, Duration::from_millis(1_999)));
+        assert!(time_limit_reached(&s, Duration::from_secs(2)));
+        assert!(time_limit_reached(&s, Duration::from_secs(3)));
     }
 
     #[test]
