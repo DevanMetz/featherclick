@@ -101,7 +101,7 @@ it.
 
 ## Headless mode
 
-Any of the run options below also opens no window:
+Any of the run options below skips the window:
 
 ```sh
 # 20 clicks, one every 100 ms, at a fixed point with a 25 px spread
@@ -127,9 +127,14 @@ featherclick --headless --clicks 100
 | `--quiet` | Print only the final summary. |
 | `--help`, `--version` | Usage and version. |
 
-Everything else (style, jitter shape, limits) comes from the saved settings.
-Exit status is `0` for a normal stop — including limits — and `1` if the input
-backend could not be reached.
+Style, jitter shape, stop-on-move and the other options come from the saved
+settings. Passing `--clicks` or `--seconds` replaces both saved limits, so
+`--seconds 30` runs for 30 seconds even if the config also has a click cap, and
+`--clicks 20` is not cut short by a saved time limit.
+
+Exit status is `0` for a normal stop — including limits — `1` if the input
+backend could not be reached or failed during a run, and `2` for invalid
+arguments.
 
 Coordinates are physical screen pixels, measured from the top-left of the
 primary display.
@@ -198,9 +203,10 @@ used 3.1% of one core, and at 10 clicks/s the processor time was too small to
 measure at all.
 
 **Precision features are not decoration.** `stop-on-move`, the click counter and
-the elapsed timer are all sampled on the same loop as the clicks, so the limits
-stop the run within one interval, and a stop is never late by more than the
-25 ms slice length.
+the elapsed timer are all sampled on the same loop as the clicks. The click cap
+is checked as soon as the final click is sent, and a time limit or pending stop
+interrupts a long interval rather than waiting it out, so a stop is noticed
+within one 25 ms sleep slice.
 
 **Lightness.** One process, one worker thread, an egui window that repaints only
 while a run is active or a countdown is on screen: 10 seconds of idle time
