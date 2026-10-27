@@ -27,6 +27,15 @@ serde_json = "1.0.151"
 # containers and minimal window managers included. Crashing on launch is worse
 # than a documented limitation.
 enigo = { version = "0.6.1", features = ["wayland"] }
+# winit's set_window_icon is a no-op on Wayland. These are the same crates
+# eframe already builds; they are named here so the window icon can be set on
+# winit's wl_display with xdg-toplevel-icon-v1.
+libc = "0.2"
+raw-window-handle = "0.6"
+wayland-backend = { version = "0.3.17", features = ["client_system"] }
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland"] }
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Media", "Win32_System_Console", "Win32_Foundation", "Win32_UI_HiDpi"] }

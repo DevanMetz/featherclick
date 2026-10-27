@@ -16,6 +16,11 @@ use crate::config::{
 use crate::engine::{Status, Worker};
 use crate::hotkeys::{self, Action, Code, Gate, GlobalHotKeyEvent, Hotkeys};
 
+#[cfg(target_os = "linux")]
+use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+#[cfg(target_os = "linux")]
+use winit::platform::wayland::WindowExtWayland;
+
 const ACCENT: Color32 = Color32::from_rgb(0x4C, 0x8D, 0xFF);
 const RUNNING: Color32 = Color32::from_rgb(0x4A, 0xD0, 0x8C);
 const DANGER: Color32 = Color32::from_rgb(0xE5, 0x6B, 0x6B);
@@ -44,6 +49,11 @@ pub struct App {
     applied_theme: Option<Theme>,
     applied_on_top: Option<bool>,
     save_error: Option<String>,
+    /// Keeps the Wayland icon buffers alive for the life of the window.
+    #[cfg(target_os = "linux")]
+    wayland_icon: Option<crate::wayland_icon::Session>,
+    #[cfg(target_os = "linux")]
+    wayland_icon_tried: bool,
 }
 
 impl App {
@@ -77,6 +87,10 @@ impl App {
             applied_theme: None,
             applied_on_top: None,
             save_error: None,
+            #[cfg(target_os = "linux")]
+            wayland_icon: None,
+            #[cfg(target_os = "linux")]
+            wayland_icon_tried: false,
         };
         app.register_hotkeys();
         app
@@ -201,6 +215,42 @@ impl App {
         if let Some(binding) = chosen {
             self.end_capture(binding);
         }
+    }
+
+    /// One attempt. X11 and Windows already get the icon from `with_icon`.
+    #[cfg(target_os = "linux")]
+    fn publish_wayland_icon(&mut self, frame: &eframe::Frame) {
+        if self.wayland_icon_tried {
+            return;
+        }
+        let Some(window) = frame.winit_window() else {
+            return;
+        };
+        let Ok(display) = window.display_handle() else {
+            self.wayland_icon_tried = true;
+            return;
+        };
+        let RawDisplayHandle::Wayland(wayland) = display.as_raw() else {
+            self.wayland_icon_tried = true;
+            return;
+        };
+        // The toplevel exists once the window does. A missing one means the
+        // shell role is not assigned yet, so try again next frame.
+        let Some(toplevel) = window.xdg_toplevel() else {
+            return;
+        };
+        let icon = crate::icon::data();
+        if let Ok(session) = crate::wayland_icon::publish(
+            wayland.display,
+            toplevel,
+            &icon.rgba,
+            icon.width,
+            icon.height,
+        ) {
+            self.wayland_icon = Some(session);
+            window.request_redraw();
+        }
+        self.wayland_icon_tried = true;
     }
 
     fn apply_window(&mut self, ctx: &egui::Context) {
@@ -625,7 +675,12 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        #[cfg(target_os = "linux")]
+        self.publish_wayland_icon(frame);
+        #[cfg(not(target_os = "linux"))]
+        let _ = frame;
+
         let ctx = ui.ctx().clone();
         self.apply_window(&ctx);
         self.poll(&ctx);
