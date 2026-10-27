@@ -54,7 +54,14 @@ fn main() -> ExitCode {
 }
 
 fn gui() -> ExitCode {
-    let settings = config::load();
+    let loaded = config::load_outcome();
+    if let Some(error) = &loaded.error {
+        // Release Windows builds have no console until this. Attach first so
+        // the message is visible when the window was started from a terminal.
+        platform::attach_console();
+        eprintln!("featherclick: {error}");
+    }
+    let settings = loaded.settings;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("FeatherClick")
