@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use enigo::{Button, Coordinate, Direction, Enigo, InputResult, Mouse, Settings as EnigoSettings};
+#[cfg(not(windows))]
+use enigo::Coordinate;
+use enigo::{Button, Direction, Enigo, InputResult, Mouse, Settings as EnigoSettings};
 
 use crate::config::{ClickStyle, JitterMode, MouseButton, PositionMode, Settings, TimingMode};
 
@@ -65,6 +67,8 @@ pub enum SessionEvent {
     /// Total clicks sent so far.
     Trigger(u64),
     Captured((i32, i32)),
+    /// A problem that does not end a running session, such as a failed pick.
+    Warning(String),
     Stopped(StopReason),
 }
 
@@ -296,18 +300,26 @@ fn apply(status: &Arc<Mutex<Status>>, event: SessionEvent) {
         SessionEvent::Captured(point) => {
             guard.captured = Some(point);
             guard.capture_seq = guard.capture_seq.wrapping_add(1);
+            // A later successful pick retires the previous read failure.
+            guard.error = None;
         }
+        SessionEvent::Warning(message) => guard.error = Some(message),
         SessionEvent::Stopped(reason) => {
             guard.running = false;
             guard.stopped = Some(Instant::now());
+            if let StopReason::Error(message) = &reason {
+                // The pill only has room for "Error"; the banner carries the text.
+                guard.error = Some(message.clone());
+            }
             guard.stop_reason = Some(reason);
         }
     }
 }
 
 fn capture(enigo: &mut Enigo, sink: &mut dyn FnMut(SessionEvent)) {
-    if let Ok(point) = enigo.location() {
-        sink(SessionEvent::Captured(point));
+    match pointer_location(enigo) {
+        Ok(point) => sink(SessionEvent::Captured(point)),
+        Err(err) => sink(SessionEvent::Warning(err)),
     }
 }
 
@@ -357,6 +369,159 @@ fn time_limit_reached(settings: &Settings, elapsed: Duration) -> bool {
     settings.max_seconds > 0 && elapsed >= Duration::from_secs(settings.max_seconds as u64)
 }
 
+/// True when this run moves the pointer itself.
+fn places_pointer(settings: &Settings) -> bool {
+    settings.position == PositionMode::Fixed || settings.jitter != JitterMode::Off
+}
+
+/// Cursor jitter is measured from wherever the pointer already is, and
+/// stop-on-move has to watch that pointer. Both need a real reading.
+fn anchor_needs_pointer(settings: &Settings) -> bool {
+    settings.stop_on_move_px > 0
+        || (settings.position == PositionMode::Cursor && settings.jitter != JitterMode::Off)
+}
+
+/// The point repeated clicks are measured from.
+///
+/// `read` is the pointer position when [`anchor_needs_pointer`] is true, and
+/// is ignored otherwise. A failed read is returned rather than replaced with
+/// the saved point: that saved point is often `(0, 0)`, and jitter would then
+/// drag the pointer to the corner.
+fn resolve_anchor(
+    settings: &Settings,
+    read: Result<(i32, i32), String>,
+) -> Result<(i32, i32), String> {
+    match settings.position {
+        PositionMode::Fixed => {
+            if settings.stop_on_move_px > 0 {
+                read?;
+            }
+            Ok(settings.point)
+        }
+        PositionMode::Cursor => {
+            if settings.jitter == JitterMode::Off && settings.stop_on_move_px == 0 {
+                Ok(settings.point)
+            } else {
+                read
+            }
+        }
+    }
+}
+
+fn anchor_for(settings: &Settings, enigo: &Enigo) -> Result<(i32, i32), String> {
+    let read = if anchor_needs_pointer(settings) {
+        pointer_location(enigo)
+    } else {
+        Ok(settings.point)
+    };
+    resolve_anchor(settings, read)
+}
+
+/// Reads the pointer in the same pixel space a click is aimed at.
+///
+/// Wayland's virtual pointer cannot report a position (enigo returns "Not
+/// implemented"). XWayland's root window can, so a second X11-only connection
+/// is used for the read and never for clicks.
+fn pointer_location(enigo: &Enigo) -> Result<(i32, i32), String> {
+    match enigo.location() {
+        Ok(point) => Ok(point),
+        Err(err) => location_fallback(err.to_string()),
+    }
+}
+
+fn location_fallback(primary: String) -> Result<(i32, i32), String> {
+    #[cfg(target_os = "linux")]
+    {
+        match x11_pointer_fallback() {
+            Ok(point) => Ok(point),
+            Err(fallback) => Err(explain_location(&primary, Some(&fallback))),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(explain_location(&primary, None))
+    }
+}
+
+fn explain_location(primary: &str, x11: Option<&str>) -> String {
+    #[cfg(target_os = "linux")]
+    if primary.contains("Not implemented") {
+        return match x11 {
+            None => "cannot read the pointer position: Wayland does not report it, and no X11 display is connected".to_string(),
+            Some(err) => format!(
+                "cannot read the pointer position: Wayland does not report it, and X11 failed ({err})"
+            ),
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = x11;
+    }
+    format!("cannot read the pointer position: {primary}")
+}
+
+/// X11 pointer read that does not join the click connection.
+///
+/// The connection is kept on this thread. Opening one per sample would add a
+/// full X handshake to every click, and stop-on-move samples on that loop.
+#[cfg(target_os = "linux")]
+fn x11_pointer_fallback() -> Result<(i32, i32), String> {
+    use std::cell::RefCell;
+
+    if std::env::var_os("DISPLAY").is_none() {
+        return Err("DISPLAY is not set".into());
+    }
+
+    struct Slot {
+        enigo: Option<Enigo>,
+        error: Option<String>,
+    }
+
+    thread_local! {
+        static LOCATOR: RefCell<Slot> = const { RefCell::new(Slot { enigo: None, error: None }) };
+    }
+
+    LOCATOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.enigo.is_none() && slot.error.is_none() {
+            let settings = enigo_settings(&BackendAttempt {
+                wayland_display: Some(ISOLATED_DISPLAY.to_string()),
+                x11_display: None,
+            });
+            match Enigo::new(&settings) {
+                Ok(enigo) => slot.enigo = Some(enigo),
+                Err(err) => slot.error = Some(err.to_string()),
+            }
+        }
+        if let Some(enigo) = slot.enigo.as_ref() {
+            return enigo.location().map_err(|err| err.to_string());
+        }
+        Err(slot
+            .error
+            .clone()
+            .unwrap_or_else(|| "could not connect to X11".to_string()))
+    })
+}
+
+/// Puts the pointer on a physical pixel.
+///
+/// On Windows, enigo's absolute move normalises into the primary monitor, so
+/// a point on any other monitor never lands and would not match
+/// `GetCursorPos`. `SetCursorPos` uses that virtual-desktop space.
+fn place_pointer(enigo: &mut Enigo, x: i32, y: i32) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let _ = enigo;
+        crate::platform::set_cursor_pos(x, y)
+    }
+    #[cfg(not(windows))]
+    {
+        enigo
+            .move_mouse(x, y, Coordinate::Abs)
+            .map_err(|err| err.to_string())
+    }
+}
+
 /// Runs one clicking session to completion. Blocks until a limit is hit or a
 /// stop command arrives.
 pub(crate) fn run_session(
@@ -384,11 +549,15 @@ pub(crate) fn run_session(
     }
 
     // Where jitter is measured from: captured once, so repeated clicks never
-    // drift away from the intended spot.
-    let anchor = match settings.position {
-        PositionMode::Fixed => settings.point,
-        PositionMode::Cursor => enigo.location().unwrap_or(settings.point),
-    };
+    // drift away from the intended spot. A run that needs the pointer and
+    // cannot read it stops here, before a guess at (0, 0) moves it.
+    let mut anchor = settings.point;
+    if reason.is_none() {
+        match anchor_for(settings, enigo) {
+            Ok(point) => anchor = point,
+            Err(err) => reason = Some(StopReason::Error(err)),
+        }
+    }
 
     let mut next = Instant::now();
     while reason.is_none() {
@@ -403,8 +572,7 @@ pub(crate) fn run_session(
 
         let target = target_point(settings, anchor);
         if let Err(err) = perform_click(enigo, settings, target) {
-            let message = err.to_string();
-            reason = Some(StopReason::Error(message));
+            reason = Some(StopReason::Error(err));
             break;
         }
         clicks += presses_per_trigger(settings.style);
@@ -417,15 +585,15 @@ pub(crate) fn run_session(
             break;
         }
 
-        if settings.stop_on_move_px > 0 {
-            let moved = enigo
-                .location()
-                .map(|now| distance(now, target) > settings.stop_on_move_px as i32)
-                .unwrap_or(false);
-            if moved {
-                reason = Some(StopReason::MouseMoved);
-                break;
-            }
+        if settings.stop_on_move_px > 0
+            && let Ok(now) = pointer_location(enigo)
+            && distance(now, target) > settings.stop_on_move_px as i32
+        {
+            // A failed read is not a move: one missed sample should not end
+            // the run. The anchor step already refused to start when the
+            // pointer cannot be read at all.
+            reason = Some(StopReason::MouseMoved);
+            break;
         }
 
         next += interval(settings);
@@ -472,23 +640,26 @@ impl From<MouseButton> for Button {
 
 /// Moves (when needed) and clicks. Kept panic-free: the pointer is only ever
 /// left pressed for the duration of this call.
-fn perform_click(enigo: &mut Enigo, settings: &Settings, target: (i32, i32)) -> InputResult<()> {
-    let needs_move = settings.position == PositionMode::Fixed || settings.jitter != JitterMode::Off;
-    if needs_move {
-        enigo.move_mouse(target.0, target.1, Coordinate::Abs)?;
+fn perform_click(enigo: &mut Enigo, settings: &Settings, target: (i32, i32)) -> Result<(), String> {
+    if places_pointer(settings) {
+        place_pointer(enigo, target.0, target.1)?;
     }
     let button = Button::from(settings.button);
     match settings.style {
-        ClickStyle::Single => press_release(enigo, button),
+        ClickStyle::Single => press_release(enigo, button).map_err(|err| err.to_string()),
         ClickStyle::Hold => {
-            enigo.button(button, Direction::Press)?;
+            enigo
+                .button(button, Direction::Press)
+                .map_err(|err| err.to_string())?;
             thread::sleep(Duration::from_millis(settings.hold_ms as u64));
-            enigo.button(button, Direction::Release)
+            enigo
+                .button(button, Direction::Release)
+                .map_err(|err| err.to_string())
         }
         ClickStyle::Double => {
-            press_release(enigo, button)?;
+            press_release(enigo, button).map_err(|err| err.to_string())?;
             thread::sleep(DOUBLE_GAP);
-            press_release(enigo, button)
+            press_release(enigo, button).map_err(|err| err.to_string())
         }
     }
 }
@@ -828,5 +999,92 @@ mod tests {
                 "an attempt that names neither server is how both end up connected"
             );
         }
+    }
+
+    #[test]
+    fn anchor_uses_a_real_pointer_only_when_the_run_needs_one() {
+        let mut s = settings();
+        s.position = PositionMode::Cursor;
+        s.jitter = JitterMode::Off;
+        s.stop_on_move_px = 0;
+        s.point = (9, 9);
+        assert!(!anchor_needs_pointer(&s));
+        assert!(!places_pointer(&s));
+        assert_eq!(
+            resolve_anchor(&s, Err("no pointer".into())).unwrap(),
+            (9, 9),
+            "cursor mode that does not move can run without a reading"
+        );
+
+        s.jitter = JitterMode::Rectangle;
+        assert!(anchor_needs_pointer(&s));
+        assert!(places_pointer(&s));
+        let err = resolve_anchor(&s, Err("no pointer".into())).unwrap_err();
+        assert!(err.contains("no pointer"), "{err}");
+        assert_eq!(resolve_anchor(&s, Ok((3, 4))).unwrap(), (3, 4));
+
+        s.jitter = JitterMode::Off;
+        s.stop_on_move_px = 5;
+        assert!(anchor_needs_pointer(&s));
+        assert_eq!(resolve_anchor(&s, Ok((3, 4))).unwrap(), (3, 4));
+
+        s.position = PositionMode::Fixed;
+        s.point = (10, 20);
+        s.stop_on_move_px = 0;
+        assert!(!anchor_needs_pointer(&s));
+        assert!(places_pointer(&s));
+        assert_eq!(
+            resolve_anchor(&s, Err("no pointer".into())).unwrap(),
+            (10, 20)
+        );
+
+        s.stop_on_move_px = 8;
+        assert!(anchor_needs_pointer(&s));
+        let err = resolve_anchor(&s, Err("gone".into())).unwrap_err();
+        assert!(err.contains("gone"), "{err}");
+        assert_eq!(
+            resolve_anchor(&s, Ok((1, 1))).unwrap(),
+            (10, 20),
+            "a fixed target stays the saved point once the pointer can be watched"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wayland_location_failure_names_the_x11_fallback() {
+        let missing = explain_location("simulating input failed: (Not implemented yet)", None);
+        assert!(missing.contains("Wayland does not report it"), "{missing}");
+        assert!(missing.contains("no X11 display"), "{missing}");
+
+        let failed = explain_location(
+            "simulating input failed: (Not implemented yet)",
+            Some("DISPLAY is not set"),
+        );
+        assert!(failed.contains("X11 failed"), "{failed}");
+        assert!(failed.contains("DISPLAY is not set"), "{failed}");
+
+        let other = explain_location("connection reset", Some("ignored"));
+        assert_eq!(other, "cannot read the pointer position: connection reset");
+    }
+
+    /// Moves the pointer. Run under Xvfb, not on a desktop session:
+    /// `xvfb-run -a cargo test -- --ignored pointer_placement`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "moves the pointer; run under xvfb"]
+    fn pointer_placement_round_trips_on_x11() {
+        let mut enigo = connect().expect("Xvfb should accept an X11 connection");
+        let target = (80, 60);
+        place_pointer(&mut enigo, target.0, target.1).expect("X11 move");
+        let seen = pointer_location(&enigo).expect("X11 read");
+        assert_eq!(
+            seen, target,
+            "the click connection did not land on the requested pixel"
+        );
+        let via_fallback = x11_pointer_fallback().expect("X11 fallback read");
+        assert_eq!(
+            via_fallback, target,
+            "the position reader and the click connection disagree"
+        );
     }
 }
