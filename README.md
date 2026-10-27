@@ -59,23 +59,25 @@ install -Dm644 featherclick.desktop ~/.local/share/applications/featherclick.des
 install -Dm644 featherclick.png ~/.local/share/icons/hicolor/256x256/apps/featherclick.png
 ```
 
+GNOME and KDE ask for remote-desktop permission the first time a run starts.
+The grant is kept in `~/.config/featherclick/portal-restore`.
+
 ## Platform support
 
 | | Windows 10/11 | macOS 11+ | Linux (X11) | Linux (Wayland) |
 | --- | --- | --- | --- | --- |
-| Clicking | ✅ | ✅ (Accessibility permission) | ✅ | ✅ wlroots only |
+| Clicking | ✅ | ✅ (Accessibility permission) | ✅ | ✅ wlroots, or the portal on GNOME and KDE |
 | Global hotkeys | ✅ | ✅ | ✅ | ❌ — use the buttons |
 | Picking a position | ✅ | ✅ | ✅ | ✅ |
 
-On Wayland, clicking uses the compositor's virtual-pointer protocol, which
-wlroots-based compositors (Sway, Hyprland) provide. GNOME and KDE are not
-covered: their only input path is the RemoteDesktop portal, and the upstream
-portal client aborts the process when no portal is present, so it is
-deliberately not compiled in — a crash on launch is worse than a documented
-gap. On compositors without virtual-pointer support, clicks still reach
-XWayland applications. Wayland has no equivalent of X11's global grabs, so
-hotkeys are unavailable there and the on-screen buttons are the way to drive
-it.
+On Wayland, wlroots compositors (Sway, Hyprland) are clicked through the
+virtual-pointer protocol. GNOME and KDE do not offer it. The first run there
+asks the RemoteDesktop portal for pointer control, stores the grant, and later
+runs reuse it. Clicks use that portal's logical layout, including a monitor
+left of the origin. If the portal is refused or missing, clicks still reach
+XWayland windows; the error is shown only when X11 cannot be used either.
+Wayland has no global grabs, so hotkeys stay unavailable there and the
+on-screen buttons drive the run.
 
 ## Using the window
 
@@ -136,8 +138,10 @@ Exit status is `0` for a normal stop — including limits — `1` if the input
 backend could not be reached or failed during a run, and `2` for invalid
 arguments.
 
-Coordinates are physical screen pixels, measured from the top-left of the
-primary display.
+Coordinates are screen pixels from the top-left of the primary display. On
+X11 and Windows they are physical pixels. A Wayland session that uses the
+remote desktop portal uses logical pixels, and a monitor can sit left of the
+origin.
 
 ## Configuration
 
