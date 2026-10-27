@@ -96,13 +96,16 @@ pub struct Status {
 }
 
 impl Status {
-    /// How long the current session has been running, or how long the last one
-    /// ran for.
+    /// How long clicking has been going, or how long the last run clicked for.
+    ///
+    /// The start delay is not included once clicking has begun, so this lines
+    /// up with the time limit. A run that was stopped during the delay reports
+    /// the time spent waiting instead.
     pub fn elapsed(&self) -> Option<Duration> {
-        match (self.started, self.stopped) {
-            (Some(start), Some(end)) => Some(end.saturating_duration_since(start)),
-            (Some(start), None) => Some(start.elapsed()),
-            _ => None,
+        let origin = self.clicking.or(self.started)?;
+        match self.stopped {
+            Some(end) => Some(end.saturating_duration_since(origin)),
+            None => Some(origin.elapsed()),
         }
     }
 }
@@ -128,13 +131,18 @@ pub struct Worker {
 impl Worker {
     /// Spawns the long-lived engine thread. It owns the platform input handle
     /// for the process lifetime and idles on the command channel when stopped.
-    pub fn spawn() -> Self {
+    ///
+    /// `wake` runs on that thread when the run starts, stops, or a point is
+    /// picked. Click counts are left to the window's own timer: waking on
+    /// every click would repaint hundreds of times a second.
+    pub fn spawn(wake: impl Fn() + Send + Sync + 'static) -> Self {
         let (tx, rx) = channel();
         let status: Arc<Mutex<Status>> = Arc::new(Mutex::new(Status::default()));
         let thread_status = Arc::clone(&status);
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
         let builder = thread::Builder::new().name("featherclick-engine".to_string());
         let spawned: std::io::Result<JoinHandle<()>> =
-            builder.spawn(move || worker_loop(&rx, &thread_status));
+            builder.spawn(move || worker_loop(&rx, &thread_status, wake.as_ref()));
         if let Err(err) = spawned {
             let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
             guard.error = Some(format!("cannot start engine thread: {err}"));
@@ -187,14 +195,18 @@ pub fn connect() -> Result<Enigo, String> {
     Enigo::new(&settings).map_err(|err| format!("cannot simulate input: {err}"))
 }
 
-fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
+fn worker_loop(
+    rx: &Receiver<Command>,
+    status: &Arc<Mutex<Status>>,
+    wake: &(dyn Fn() + Send + Sync),
+) {
     let mut enigo = match connect() {
         Ok(enigo) => Some(enigo),
         Err(err) => {
             // One attempt. A second connection here used to be only for the
             // message, and a success on that retry left the thread with neither
             // a handle nor an error.
-            status.lock().unwrap_or_else(|e| e.into_inner()).error = Some(err);
+            note_error(status, wake, err);
             None
         }
     };
@@ -211,7 +223,7 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
                     enigo = connect().ok();
                 }
                 if let Some(handle) = enigo.as_mut() {
-                    capture(handle, &mut |event| apply(status, event));
+                    capture(handle, &mut |event| apply(status, event, wake));
                 }
             }
             Ok(Command::Start(settings)) | Ok(Command::Toggle(settings)) => {
@@ -223,45 +235,58 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
                     match connect() {
                         Ok(handle) => enigo = Some(handle),
                         Err(err) => {
-                            status.lock().unwrap_or_else(|e| e.into_inner()).error = Some(err);
+                            note_error(status, wake, err);
                             continue;
                         }
                     }
                 }
                 if let Some(handle) = enigo.as_mut() {
-                    run_session(&settings, rx, handle, &mut |event| apply(status, event));
+                    run_session(&settings, rx, handle, &mut |event| {
+                        apply(status, event, wake)
+                    });
                 }
             }
         }
     }
 }
 
+fn note_error(status: &Mutex<Status>, wake: &(dyn Fn() + Send + Sync), message: String) {
+    status.lock().unwrap_or_else(|e| e.into_inner()).error = Some(message);
+    wake();
+}
+
 /// Applies a session event to the shared status. Kept out of `Worker` so the
 /// worker thread can use it without cloning the handle.
-fn apply(status: &Arc<Mutex<Status>>, event: SessionEvent) {
-    let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
-    match event {
-        SessionEvent::Started { arm_until } => {
-            guard.running = true;
-            guard.clicks = 0;
-            guard.started = Some(Instant::now());
-            guard.arm_until = arm_until;
-            guard.clicking = None;
-            guard.stopped = None;
-            guard.stop_reason = None;
-            guard.error = None;
+fn apply(status: &Arc<Mutex<Status>>, event: SessionEvent, wake: &(dyn Fn() + Send + Sync)) {
+    let notify = !matches!(event, SessionEvent::Trigger(_));
+    {
+        let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
+        match event {
+            SessionEvent::Started { arm_until } => {
+                guard.running = true;
+                guard.clicks = 0;
+                guard.started = Some(Instant::now());
+                guard.arm_until = arm_until;
+                guard.clicking = None;
+                guard.stopped = None;
+                guard.stop_reason = None;
+                guard.error = None;
+            }
+            SessionEvent::Clicking => guard.clicking = Some(Instant::now()),
+            SessionEvent::Trigger(clicks) => guard.clicks = clicks,
+            SessionEvent::Captured(point) => {
+                guard.captured = Some(point);
+                guard.capture_seq = guard.capture_seq.wrapping_add(1);
+            }
+            SessionEvent::Stopped(reason) => {
+                guard.running = false;
+                guard.stopped = Some(Instant::now());
+                guard.stop_reason = Some(reason);
+            }
         }
-        SessionEvent::Clicking => guard.clicking = Some(Instant::now()),
-        SessionEvent::Trigger(clicks) => guard.clicks = clicks,
-        SessionEvent::Captured(point) => {
-            guard.captured = Some(point);
-            guard.capture_seq = guard.capture_seq.wrapping_add(1);
-        }
-        SessionEvent::Stopped(reason) => {
-            guard.running = false;
-            guard.stopped = Some(Instant::now());
-            guard.stop_reason = Some(reason);
-        }
+    }
+    if notify {
+        wake();
     }
 }
 
@@ -765,6 +790,30 @@ mod tests {
             Some(now),
             now + Duration::from_secs(3_600)
         ));
+    }
+
+    #[test]
+    fn the_reported_duration_starts_when_clicking_does() {
+        let started = Instant::now();
+        let clicking = started + Duration::from_millis(1_500);
+        let finished = Status {
+            started: Some(started),
+            clicking: Some(clicking),
+            stopped: Some(clicking + Duration::from_millis(1_000)),
+            ..Status::default()
+        };
+        assert_eq!(finished.elapsed(), Some(Duration::from_millis(1_000)));
+
+        let interrupted = Status {
+            started: Some(started),
+            stopped: Some(started + Duration::from_millis(400)),
+            ..Status::default()
+        };
+        assert_eq!(
+            interrupted.elapsed(),
+            Some(Duration::from_millis(400)),
+            "stopping during the delay reports the wait, not nothing"
+        );
     }
 
     /// Clicks on the real pointer. Ignored so `cargo test` on a desktop does

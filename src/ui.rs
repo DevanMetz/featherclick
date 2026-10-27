@@ -1,8 +1,9 @@
 //! The egui interface.
 //!
 //! The window repaints only when something happens: while the engine is
-//! running (to tick the counters) and while a countdown is on screen. An idle
-//! window costs nothing.
+//! running (to tick the counters), while a countdown is on screen, and when
+//! the engine reports that a run started, stopped, or a point was picked. An
+//! idle window costs nothing.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -48,7 +49,6 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, settings: Settings) -> Self {
-        let worker = Worker::spawn();
         let shared = Arc::new(Mutex::new(settings.clone()));
 
         // Both hotkey backends require the thread that owns the event loop, and
@@ -60,6 +60,8 @@ impl App {
 
         apply_style(&cc.egui_ctx);
         install_visuals(&cc.egui_ctx);
+        let ctx = cc.egui_ctx.clone();
+        let worker = Worker::spawn(move || ctx.request_repaint());
         spawn_notifier(cc.egui_ctx.clone(), worker.clone(), Arc::clone(&shared));
 
         let mut app = Self {
@@ -232,10 +234,16 @@ impl App {
     }
 
     fn header(&mut self, ui: &mut Ui) {
+        let waiting = arming_left(
+            self.status.running,
+            self.status.clicking.is_some(),
+            self.status.arm_until,
+            Instant::now(),
+        );
         ui.horizontal(|ui| {
             ui.label(RichText::new("FeatherClick").size(17.0).strong());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let (text, colour) = self.status_pill();
+                let (text, colour) = self.status_pill(waiting.is_some());
                 Frame::NONE
                     .fill(colour.gamma_multiply(0.16))
                     .stroke(Stroke::new(1.0, colour.gamma_multiply(0.45)))
@@ -273,15 +281,11 @@ impl App {
         }
 
         ui.add_space(6.0);
-        let elapsed = self.status.elapsed().unwrap_or_default().as_secs_f64();
-        let clicks = self.status.clicks;
-        let mut line = format!("{clicks} clicks");
-        if elapsed > 0.0 {
-            line += &format!("  ·  {elapsed:.1} s");
-            if elapsed > 0.25 {
-                line += &format!("  ·  {:.1}/s", clicks as f64 / elapsed);
-            }
-        }
+        let line = stats_line(
+            self.status.clicks,
+            self.status.elapsed().unwrap_or_default(),
+            waiting,
+        );
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(line)
@@ -321,9 +325,12 @@ impl App {
         }
     }
 
-    fn status_pill(&self) -> (String, Color32) {
+    fn status_pill(&self, waiting: bool) -> (String, Color32) {
         if self.status.error.is_some() {
             return ("Error".to_string(), DANGER);
+        }
+        if waiting {
+            return ("Waiting".to_string(), ACCENT);
         }
         if self.status.running {
             return ("Running".to_string(), RUNNING);
@@ -670,6 +677,39 @@ fn ui_muted() -> Color32 {
     Color32::from_gray(140)
 }
 
+/// Time left before the first click. Stays `Some` — including zero — until
+/// clicking actually starts, so a late wake cannot flash the delay as if it
+/// were already part of the run.
+fn arming_left(
+    running: bool,
+    clicking: bool,
+    arm_until: Option<Instant>,
+    now: Instant,
+) -> Option<Duration> {
+    if !running || clicking {
+        return None;
+    }
+    arm_until.map(|until| until.saturating_duration_since(now))
+}
+
+fn stats_line(clicks: u64, elapsed: Duration, arming: Option<Duration>) -> String {
+    if let Some(left) = arming {
+        return format!(
+            "{clicks} clicks  ·  starting in {:.1} s",
+            left.as_secs_f64()
+        );
+    }
+    let mut line = format!("{clicks} clicks");
+    let secs = elapsed.as_secs_f64();
+    if secs > 0.0 {
+        line += &format!("  ·  {secs:.1} s");
+        if secs > 0.25 {
+            line += &format!("  ·  {:.1}/s", clicks as f64 / secs);
+        }
+    }
+    line
+}
+
 /// A titled group box.
 fn section(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
     ui.add_space(9.0);
@@ -870,4 +910,50 @@ fn key_to_code(key: egui::Key) -> Option<Code> {
         K::CloseBracket => Code::BracketRight,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_delay_counts_down_until_clicking_starts() {
+        let now = Instant::now();
+        let until = now + Duration::from_millis(1_600);
+        assert_eq!(
+            arming_left(true, false, Some(until), now + Duration::from_millis(400)),
+            Some(Duration::from_millis(1_200))
+        );
+        // The deadline can pass a slice before the engine says clicking began.
+        // Keep the countdown, including zero, so the run clock does not jump.
+        assert_eq!(
+            arming_left(true, false, Some(now), now + Duration::from_millis(20)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            arming_left(true, true, Some(until), now),
+            None,
+            "clicking replaces the countdown"
+        );
+        assert_eq!(arming_left(false, false, Some(until), now), None);
+        assert_eq!(arming_left(true, false, None, now), None);
+
+        assert_eq!(
+            stats_line(
+                0,
+                Duration::from_millis(400),
+                Some(Duration::from_millis(1_200))
+            ),
+            "0 clicks  ·  starting in 1.2 s"
+        );
+        assert_eq!(
+            stats_line(5, Duration::from_millis(500), None),
+            "5 clicks  ·  0.5 s  ·  10.0/s"
+        );
+        assert_eq!(
+            stats_line(0, Duration::from_millis(100), None),
+            "0 clicks  ·  0.1 s"
+        );
+        assert_eq!(stats_line(0, Duration::ZERO, None), "0 clicks");
+    }
 }
