@@ -255,6 +255,14 @@ pub fn save(settings: &Settings) -> std::io::Result<()> {
     write_at(&config_path(), settings, false)
 }
 
+/// Like [`save`], but copies an existing file to `config.json.bak` first.
+///
+/// The copy happens before the replacement. If the copy fails, the original
+/// file is left alone.
+pub fn save_with_backup(settings: &Settings) -> std::io::Result<()> {
+    write_at(&config_path(), settings, true)
+}
+
 fn read_at(path: &Path) -> LoadOutcome {
     match std::fs::read_to_string(path) {
         Ok(raw) => match serde_json::from_str::<Settings>(&raw) {

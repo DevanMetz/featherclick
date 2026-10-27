@@ -61,7 +61,6 @@ fn gui() -> ExitCode {
         platform::attach_console();
         eprintln!("featherclick: {error}");
     }
-    let settings = loaded.settings;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("FeatherClick")
@@ -75,7 +74,7 @@ fn gui() -> ExitCode {
     let created = eframe::run_native(
         "FeatherClick",
         options,
-        Box::new(move |cc| Ok(Box::new(ui::App::new(cc, settings)))),
+        Box::new(move |cc| Ok(Box::new(ui::App::new(cc, loaded)))),
     );
 
     match created {

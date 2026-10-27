@@ -137,7 +137,7 @@ impl Worker {
     }
 
     pub fn start(&self, settings: &Settings) {
-        self.send(Command::Start(Box::new(settings.clone())));
+        self.send(Command::Start(Box::new(snapshot(settings))));
     }
 
     pub fn stop(&self) {
@@ -145,7 +145,7 @@ impl Worker {
     }
 
     pub fn toggle(&self, settings: &Settings) {
-        self.send(Command::Toggle(Box::new(settings.clone())));
+        self.send(Command::Toggle(Box::new(snapshot(settings))));
     }
 
     pub fn capture_cursor(&self) {
@@ -162,6 +162,14 @@ impl Worker {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+}
+
+/// Clamps a copy the same way loading the file does, so a run cannot use a
+/// range the next launch would have repaired.
+fn snapshot(settings: &Settings) -> Settings {
+    let mut settings = settings.clone();
+    settings.sanitize();
+    settings
 }
 
 /// Connects to the platform input backend. Boxed error text is what the user
@@ -574,6 +582,32 @@ mod tests {
         let mut s = Settings::default();
         s.sanitize();
         s
+    }
+
+    #[test]
+    fn a_run_snapshot_is_clamped_like_a_loaded_config() {
+        let mut raw = settings();
+        raw.timing = TimingMode::Uniform;
+        raw.interval_ms = 0;
+        raw.interval_min_ms = 300;
+        raw.interval_max_ms = 50;
+        raw.interval_mean_ms = 40;
+        raw.interval_std_ms = 900;
+
+        let ready = snapshot(&raw);
+        assert_eq!(ready.interval_ms, 1);
+        assert_eq!((ready.interval_min_ms, ready.interval_max_ms), (50, 300));
+        assert!(ready.interval_std_ms <= ready.interval_mean_ms);
+        // The caller's fields stay where the drag left them.
+        assert_eq!(raw.interval_min_ms, 300);
+
+        for _ in 0..1_000 {
+            let ms = interval(&ready).as_secs_f64() * 1000.0;
+            assert!(
+                (50.0..=300.0).contains(&ms),
+                "{ms} ms is outside the clamped range"
+            );
+        }
     }
 
     #[test]
