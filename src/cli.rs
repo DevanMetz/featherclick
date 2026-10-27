@@ -28,7 +28,7 @@ RUN OPTIONS:
         --at <X,Y>              click a fixed screen point
         --jitter <PX>           vary the point by up to +-PX pixels
         --button <left|right|middle>
-        --delay <MS>            wait before the first click
+        --delay <MS>            wait before the first click; the time limit starts afterwards
         --quiet                 print only the final summary
 
 OTHER OPTIONS:
@@ -230,7 +230,7 @@ impl Run {
             }
             SessionEvent::Captured(point) => println!("{},{}", point.0, point.1),
             SessionEvent::Stopped(reason) => stopped = Some(reason),
-            SessionEvent::Started => {}
+            SessionEvent::Started { .. } | SessionEvent::Clicking => {}
         };
 
         engine::run_session(&settings, &commands, &mut enigo, &mut sink);
@@ -278,7 +278,7 @@ fn describe(settings: &Settings) -> String {
     };
     let delay = match settings.start_delay_ms {
         0 => String::new(),
-        ms => format!(" after {ms} ms"),
+        ms => format!(", after {ms} ms"),
     };
     format!(
         "{} {} {}{jitter}, {limits}{delay}",
@@ -364,6 +364,23 @@ mod tests {
         };
         let run = applied(&saved, &["--interval", "10"]);
         assert_eq!((run.max_clicks, run.max_seconds), (50, 5));
+    }
+
+    #[test]
+    fn the_summary_keeps_the_delay_apart_from_the_limit() {
+        let settings = Settings {
+            timing: TimingMode::Fixed,
+            interval_ms: 100,
+            position: PositionMode::Fixed,
+            point: (1, 2),
+            max_seconds: 30,
+            start_delay_ms: 2_000,
+            ..Settings::default()
+        };
+        assert_eq!(
+            describe(&settings),
+            "left every 100 ms at 1,2, 30 s, after 2000 ms"
+        );
     }
 
     #[test]
