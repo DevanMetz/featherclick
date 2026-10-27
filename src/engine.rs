@@ -105,7 +105,42 @@ pub(crate) enum Command {
     /// is made against authoritative state rather than a stale UI read.
     Toggle(Box<Settings>),
     Capture,
+    /// Latest position of the FeatherClick window. Headless runs never send one.
+    Window(WindowShield),
     Shutdown,
+}
+
+/// Outer bounds of the FeatherClick window, in physical screen pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScreenRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl ScreenRect {
+    /// Inclusive of the minimum edge, exclusive of the far edge.
+    pub(crate) fn contains(self, x: i32, y: i32) -> bool {
+        if self.width <= 0 || self.height <= 0 {
+            return false;
+        }
+        let x1 = self.x.saturating_add(self.width);
+        let y1 = self.y.saturating_add(self.height);
+        x >= self.x && y >= self.y && x < x1 && y < y1
+    }
+}
+
+/// Where the window is, so a run can avoid clicking it.
+///
+/// Pressing Start leaves the pointer on that button. The next click would
+/// land on Stop and the run would end before it began. A click whose point
+/// is inside [`Self::rect`] is held. Wayland cannot report a position;
+/// [`Self::pointer_over`] covers cursor mode there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct WindowShield {
+    pub rect: Option<ScreenRect>,
+    pub pointer_over: bool,
 }
 
 #[derive(Clone)]
@@ -152,6 +187,10 @@ impl Worker {
         self.send(Command::Capture);
     }
 
+    pub(crate) fn set_window(&self, shield: WindowShield) {
+        self.send(Command::Window(shield));
+    }
+
     pub fn shutdown(&self) {
         self.send(Command::Shutdown);
     }
@@ -182,6 +221,7 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
         let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
         guard.error = connect().err();
     }
+    let mut shield = WindowShield::default();
 
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
@@ -189,6 +229,7 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
             Err(RecvTimeoutError::Timeout) => {}
             Ok(Command::Shutdown) => break,
             Ok(Command::Stop) => {}
+            Ok(Command::Window(update)) => shield = update,
             Ok(Command::Capture) => {
                 // Retry the connection: a display may have appeared since launch.
                 if enigo.is_none() {
@@ -212,7 +253,9 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
                         guard.error = connect().err();
                     }
                     Some(handle) => {
-                        run_session(&settings, rx, handle, &mut |event| apply(status, event));
+                        run_session(&settings, rx, handle, &mut shield, &mut |event| {
+                            apply(status, event)
+                        });
                     }
                 }
             }
@@ -258,13 +301,19 @@ enum Polled {
     Stop(StopReason),
 }
 
-fn poll(rx: &Receiver<Command>, enigo: &mut Enigo, sink: &mut dyn FnMut(SessionEvent)) -> Polled {
+fn poll(
+    rx: &Receiver<Command>,
+    enigo: &mut Enigo,
+    shield: &mut WindowShield,
+    sink: &mut dyn FnMut(SessionEvent),
+) -> Polled {
     loop {
         match rx.try_recv() {
             Err(TryRecvError::Empty) => return Polled::Continue,
             Err(TryRecvError::Disconnected) => return Polled::Stop(StopReason::Shutdown),
             Ok(Command::Stop) | Ok(Command::Toggle(_)) => return Polled::Stop(StopReason::User),
             Ok(Command::Shutdown) => return Polled::Stop(StopReason::Shutdown),
+            Ok(Command::Window(update)) => *shield = update,
             Ok(Command::Capture) => capture(enigo, sink),
             // Already running; a second Start is a no-op.
             Ok(Command::Start(_)) => {}
@@ -279,12 +328,13 @@ fn stop_check(
     started: Instant,
     rx: &Receiver<Command>,
     enigo: &mut Enigo,
+    shield: &mut WindowShield,
     sink: &mut dyn FnMut(SessionEvent),
 ) -> Option<StopReason> {
     if time_limit_reached(settings, started.elapsed()) {
         return Some(StopReason::TimeLimit);
     }
-    match poll(rx, enigo, sink) {
+    match poll(rx, enigo, shield, sink) {
         Polled::Continue => None,
         Polled::Stop(reason) => Some(reason),
     }
@@ -304,6 +354,7 @@ pub(crate) fn run_session(
     settings: &Settings,
     rx: &Receiver<Command>,
     enigo: &mut Enigo,
+    shield: &mut WindowShield,
     sink: &mut dyn FnMut(SessionEvent),
 ) {
     let _timer = crate::platform::TimerResolution::acquire();
@@ -318,18 +369,16 @@ pub(crate) fn run_session(
     if settings.start_delay_ms > 0 {
         let deadline = started + Duration::from_millis(settings.start_delay_ms as u64);
         if let Some(stopped) = waiter.wait(deadline, &mut || {
-            stop_check(settings, started, rx, enigo, sink)
+            stop_check(settings, started, rx, enigo, shield, sink)
         }) {
             reason = Some(stopped);
         }
     }
 
-    // Where jitter is measured from: captured once, so repeated clicks never
-    // drift away from the intended spot.
-    let anchor = match settings.position {
-        PositionMode::Fixed => settings.point,
-        PositionMode::Cursor => enigo.location().unwrap_or(settings.point),
-    };
+    // Where jitter is measured from. Captured once so later clicks do not
+    // drift. Cursor mode waits until the pointer is off this window: Start
+    // leaves it on that button, and capturing there would aim the run at Stop.
+    let mut anchor: Option<(i32, i32)> = None;
 
     let mut next = Instant::now();
     while reason.is_none() {
@@ -342,7 +391,21 @@ pub(crate) fn run_session(
             break;
         }
 
-        let target = target_point(settings, anchor);
+        let pointer = enigo.location().ok();
+        let target = match click_plan(settings, &mut anchor, pointer, shield) {
+            ClickPlan::Hold => {
+                if let Some(stopped) = waiter.wait(Instant::now() + MAX_SLEEP_SLICE, &mut || {
+                    stop_check(settings, started, rx, enigo, shield, sink)
+                }) {
+                    reason = Some(stopped);
+                }
+                // The interval is measured from a click. Leaving `next` in the
+                // past would resynchronise and then fire a second click at once.
+                next = Instant::now();
+                continue;
+            }
+            ClickPlan::Fire(target) => target,
+        };
         if let Err(err) = perform_click(enigo, settings, target) {
             let message = err.to_string();
             reason = Some(StopReason::Error(message));
@@ -376,9 +439,9 @@ pub(crate) fn run_session(
             // than firing a burst to catch up.
             next = now;
         }
-        if let Some(stopped) =
-            waiter.wait(next, &mut || stop_check(settings, started, rx, enigo, sink))
-        {
+        if let Some(stopped) = waiter.wait(next, &mut || {
+            stop_check(settings, started, rx, enigo, shield, sink)
+        }) {
             reason = Some(stopped);
         }
     }
@@ -411,11 +474,67 @@ impl From<MouseButton> for Button {
     }
 }
 
+/// Whether this click moves the pointer. Cursor mode with jitter off clicks
+/// wherever the pointer already is.
+fn places_pointer(settings: &Settings) -> bool {
+    settings.position == PositionMode::Fixed || settings.jitter != JitterMode::Off
+}
+
+/// `places` is true when the click will be moved to `aim`. With no rectangle
+/// (Wayland), only a click that stays at the live pointer can be held, and
+/// only while that pointer is over the window.
+fn aimed_at_window(aim: (i32, i32), places: bool, shield: &WindowShield) -> bool {
+    if let Some(rect) = shield.rect {
+        return rect.contains(aim.0, aim.1);
+    }
+    !places && shield.pointer_over
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClickPlan {
+    /// Skip this trigger; the aim is on the FeatherClick window.
+    Hold,
+    Fire((i32, i32)),
+}
+
+/// Decides the next trigger without touching the input connection, so the
+/// window check can be tested on its own.
+fn click_plan(
+    settings: &Settings,
+    anchor: &mut Option<(i32, i32)>,
+    pointer: Option<(i32, i32)>,
+    shield: &WindowShield,
+) -> ClickPlan {
+    if anchor.is_none() {
+        match settings.position {
+            PositionMode::Fixed => *anchor = Some(settings.point),
+            PositionMode::Cursor => match pointer {
+                // A failed read is not "over the window": keep the old fallback
+                // point and let the click go out.
+                Some(point) if !aimed_at_window(point, false, shield) => *anchor = Some(point),
+                Some(_) => return ClickPlan::Hold,
+                None => *anchor = Some(settings.point),
+            },
+        }
+    }
+    let Some(anchor_point) = *anchor else {
+        return ClickPlan::Hold;
+    };
+    let target = target_point(settings, anchor_point);
+    let places = places_pointer(settings);
+    // Cursor mode clicks at the live pointer. Anything that moves the pointer
+    // is judged by where it would be placed, so jitter can still miss the window.
+    let aim = if places { Some(target) } else { pointer };
+    if aim.is_some_and(|point| aimed_at_window(point, places, shield)) {
+        return ClickPlan::Hold;
+    }
+    ClickPlan::Fire(target)
+}
+
 /// Moves (when needed) and clicks. Kept panic-free: the pointer is only ever
 /// left pressed for the duration of this call.
 fn perform_click(enigo: &mut Enigo, settings: &Settings, target: (i32, i32)) -> InputResult<()> {
-    let needs_move = settings.position == PositionMode::Fixed || settings.jitter != JitterMode::Off;
-    if needs_move {
+    if places_pointer(settings) {
         enigo.move_mouse(target.0, target.1, Coordinate::Abs)?;
     }
     let button = Button::from(settings.button);
@@ -568,7 +687,7 @@ impl Waiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{JitterMode, TimingMode};
+    use crate::config::{JitterMode, PositionMode, TimingMode};
 
     fn settings() -> Settings {
         let mut s = Settings::default();
@@ -726,6 +845,173 @@ mod tests {
         assert!(
             total < Duration::from_secs(5),
             "20 waits of 20 ms took {total:?}"
+        );
+    }
+
+    fn window_at(x: i32, y: i32) -> WindowShield {
+        WindowShield {
+            rect: Some(ScreenRect {
+                x,
+                y,
+                width: 200,
+                height: 200,
+            }),
+            pointer_over: false,
+        }
+    }
+
+    #[test]
+    fn screen_rect_contains_is_half_open_and_does_not_panic_at_the_extremes() {
+        let rect = ScreenRect {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+        };
+        assert!(rect.contains(10, 20));
+        assert!(rect.contains(39, 59));
+        assert!(!rect.contains(40, 20));
+        assert!(!rect.contains(10, 60));
+        assert!(!rect.contains(9, 20));
+        assert!(
+            !ScreenRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 10
+            }
+            .contains(0, 0)
+        );
+        assert!(
+            !ScreenRect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: -1
+            }
+            .contains(5, 0)
+        );
+
+        let edge = ScreenRect {
+            x: i32::MAX - 5,
+            y: i32::MIN,
+            width: i32::MAX,
+            height: i32::MAX,
+        };
+        assert!(edge.contains(i32::MAX - 5, i32::MIN));
+        assert!(!edge.contains(i32::MAX, i32::MIN));
+        let _ = ScreenRect {
+            x: i32::MIN,
+            y: i32::MIN,
+            width: i32::MAX,
+            height: i32::MAX,
+        }
+        .contains(0, 0);
+    }
+
+    #[test]
+    fn cursor_mode_holds_until_the_pointer_leaves_the_window() {
+        let mut s = settings();
+        s.position = PositionMode::Cursor;
+        s.jitter = JitterMode::Off;
+        s.point = (150, 150);
+        let shield = window_at(100, 100);
+
+        let mut anchor = None;
+        assert_eq!(
+            click_plan(&s, &mut anchor, Some((150, 150)), &shield),
+            ClickPlan::Hold
+        );
+        assert_eq!(anchor, None, "the Start button must not become the anchor");
+
+        assert_eq!(
+            click_plan(&s, &mut anchor, Some((10, 10)), &shield),
+            ClickPlan::Fire((10, 10))
+        );
+        assert_eq!(anchor, Some((10, 10)));
+
+        assert_eq!(
+            click_plan(&s, &mut anchor, Some((150, 150)), &shield),
+            ClickPlan::Hold
+        );
+        assert_eq!(anchor, Some((10, 10)));
+
+        // A missing pointer read is not evidence the pointer is over the window,
+        // even when the fallback point sits inside the rectangle.
+        let mut anchor = None;
+        assert_eq!(
+            click_plan(&s, &mut anchor, None, &shield),
+            ClickPlan::Fire((150, 150))
+        );
+        assert_eq!(anchor, Some((150, 150)));
+
+        // Jitter still has to leave the window before the anchor is taken, so a
+        // scatter cannot click Stop on the first triggers.
+        s.jitter = JitterMode::Rectangle;
+        s.jitter_x = 40;
+        s.jitter_y = 40;
+        let mut anchor = None;
+        assert_eq!(
+            click_plan(&s, &mut anchor, Some((150, 150)), &shield),
+            ClickPlan::Hold
+        );
+        assert_eq!(anchor, None);
+    }
+
+    #[test]
+    fn fixed_mode_holds_only_while_the_point_is_inside_the_window() {
+        let mut s = settings();
+        s.position = PositionMode::Fixed;
+        s.jitter = JitterMode::Off;
+        s.point = (150, 160);
+        let shield = window_at(100, 100);
+
+        let mut anchor = None;
+        assert_eq!(
+            click_plan(&s, &mut anchor, Some((10, 10)), &shield),
+            ClickPlan::Hold
+        );
+        assert_eq!(anchor, Some((150, 160)));
+
+        s.point = (10, 20);
+        let mut anchor = None;
+        assert_eq!(
+            click_plan(&s, &mut anchor, Some((150, 150)), &shield),
+            ClickPlan::Fire((10, 20))
+        );
+        assert_eq!(anchor, Some((10, 20)));
+    }
+
+    #[test]
+    fn without_a_rectangle_only_cursor_mode_watches_the_hover() {
+        let mut s = settings();
+        s.position = PositionMode::Cursor;
+        s.jitter = JitterMode::Off;
+        s.point = (4, 5);
+        let over = WindowShield {
+            rect: None,
+            pointer_over: true,
+        };
+
+        let mut anchor = None;
+        assert_eq!(
+            click_plan(&s, &mut anchor, Some((150, 150)), &WindowShield::default()),
+            ClickPlan::Fire((150, 150))
+        );
+
+        let mut anchor = None;
+        assert_eq!(
+            click_plan(&s, &mut anchor, Some((150, 150)), &over),
+            ClickPlan::Hold
+        );
+        assert_eq!(anchor, None);
+
+        s.position = PositionMode::Fixed;
+        s.point = (10, 20);
+        let mut anchor = None;
+        assert_eq!(
+            click_plan(&s, &mut anchor, Some((150, 150)), &over),
+            ClickPlan::Fire((10, 20))
         );
     }
 

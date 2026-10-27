@@ -233,7 +233,9 @@ impl Run {
             SessionEvent::Started => {}
         };
 
-        engine::run_session(&settings, &commands, &mut enigo, &mut sink);
+        // Headless has no window of its own, so nothing is held back.
+        let mut shield = engine::WindowShield::default();
+        engine::run_session(&settings, &commands, &mut enigo, &mut shield, &mut sink);
 
         let elapsed = start.elapsed().as_secs_f64();
         let reason = stopped.unwrap_or(StopReason::Shutdown);
