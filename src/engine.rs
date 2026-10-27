@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use enigo::{Button, Coordinate, Direction, Enigo, InputResult, Mouse, Settings as EnigoSettings};
+use enigo::{Button, Direction};
+
+use crate::input::Input;
 
 use crate::config::{ClickStyle, JitterMode, MouseButton, PositionMode, Settings, TimingMode};
 
@@ -166,19 +168,13 @@ impl Worker {
 
 /// Connects to the platform input backend. Boxed error text is what the user
 /// needs on a headless Linux box with no X11/Wayland session.
-pub fn connect() -> Result<Enigo, String> {
-    let settings = EnigoSettings {
-        // Every extra millisecond of per-event delay is a millisecond off the
-        // achievable click rate.
-        linux_delay: 0,
-        ..EnigoSettings::default()
-    };
-    Enigo::new(&settings).map_err(|err| format!("cannot simulate input: {err}"))
+pub fn connect() -> Result<Input, String> {
+    crate::input::connect()
 }
 
 fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
-    let mut enigo = connect().ok();
-    if enigo.is_none() {
+    let mut input = connect().ok();
+    if input.is_none() {
         let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
         guard.error = connect().err();
     }
@@ -191,10 +187,10 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
             Ok(Command::Stop) => {}
             Ok(Command::Capture) => {
                 // Retry the connection: a display may have appeared since launch.
-                if enigo.is_none() {
-                    enigo = connect().ok();
+                if input.is_none() {
+                    input = connect().ok();
                 }
-                if let Some(handle) = enigo.as_mut() {
+                if let Some(handle) = input.as_mut() {
                     capture(handle, &mut |event| apply(status, event));
                 }
             }
@@ -203,10 +199,10 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
                 if !idle {
                     continue;
                 }
-                if enigo.is_none() {
-                    enigo = connect().ok();
+                if input.is_none() {
+                    input = connect().ok();
                 }
-                match enigo.as_mut() {
+                match input.as_mut() {
                     None => {
                         let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
                         guard.error = connect().err();
@@ -246,8 +242,8 @@ fn apply(status: &Arc<Mutex<Status>>, event: SessionEvent) {
     }
 }
 
-fn capture(enigo: &mut Enigo, sink: &mut dyn FnMut(SessionEvent)) {
-    if let Ok(point) = enigo.location() {
+fn capture(input: &mut Input, sink: &mut dyn FnMut(SessionEvent)) {
+    if let Ok(point) = input.location() {
         sink(SessionEvent::Captured(point));
     }
 }
@@ -258,14 +254,14 @@ enum Polled {
     Stop(StopReason),
 }
 
-fn poll(rx: &Receiver<Command>, enigo: &mut Enigo, sink: &mut dyn FnMut(SessionEvent)) -> Polled {
+fn poll(rx: &Receiver<Command>, input: &mut Input, sink: &mut dyn FnMut(SessionEvent)) -> Polled {
     loop {
         match rx.try_recv() {
             Err(TryRecvError::Empty) => return Polled::Continue,
             Err(TryRecvError::Disconnected) => return Polled::Stop(StopReason::Shutdown),
             Ok(Command::Stop) | Ok(Command::Toggle(_)) => return Polled::Stop(StopReason::User),
             Ok(Command::Shutdown) => return Polled::Stop(StopReason::Shutdown),
-            Ok(Command::Capture) => capture(enigo, sink),
+            Ok(Command::Capture) => capture(input, sink),
             // Already running; a second Start is a no-op.
             Ok(Command::Start(_)) => {}
         }
@@ -278,13 +274,13 @@ fn stop_check(
     settings: &Settings,
     started: Instant,
     rx: &Receiver<Command>,
-    enigo: &mut Enigo,
+    input: &mut Input,
     sink: &mut dyn FnMut(SessionEvent),
 ) -> Option<StopReason> {
     if time_limit_reached(settings, started.elapsed()) {
         return Some(StopReason::TimeLimit);
     }
-    match poll(rx, enigo, sink) {
+    match poll(rx, input, sink) {
         Polled::Continue => None,
         Polled::Stop(reason) => Some(reason),
     }
@@ -303,7 +299,7 @@ fn time_limit_reached(settings: &Settings, elapsed: Duration) -> bool {
 pub(crate) fn run_session(
     settings: &Settings,
     rx: &Receiver<Command>,
-    enigo: &mut Enigo,
+    input: &mut Input,
     sink: &mut dyn FnMut(SessionEvent),
 ) {
     let _timer = crate::platform::TimerResolution::acquire();
@@ -318,7 +314,7 @@ pub(crate) fn run_session(
     if settings.start_delay_ms > 0 {
         let deadline = started + Duration::from_millis(settings.start_delay_ms as u64);
         if let Some(stopped) = waiter.wait(deadline, &mut || {
-            stop_check(settings, started, rx, enigo, sink)
+            stop_check(settings, started, rx, input, sink)
         }) {
             reason = Some(stopped);
         }
@@ -328,7 +324,7 @@ pub(crate) fn run_session(
     // drift away from the intended spot.
     let anchor = match settings.position {
         PositionMode::Fixed => settings.point,
-        PositionMode::Cursor => enigo.location().unwrap_or(settings.point),
+        PositionMode::Cursor => input.location().unwrap_or(settings.point),
     };
 
     let mut next = Instant::now();
@@ -343,8 +339,7 @@ pub(crate) fn run_session(
         }
 
         let target = target_point(settings, anchor);
-        if let Err(err) = perform_click(enigo, settings, target) {
-            let message = err.to_string();
+        if let Err(message) = perform_click(input, settings, target) {
             reason = Some(StopReason::Error(message));
             break;
         }
@@ -359,7 +354,7 @@ pub(crate) fn run_session(
         }
 
         if settings.stop_on_move_px > 0 {
-            let moved = enigo
+            let moved = input
                 .location()
                 .map(|now| distance(now, target) > settings.stop_on_move_px as i32)
                 .unwrap_or(false);
@@ -377,7 +372,7 @@ pub(crate) fn run_session(
             next = now;
         }
         if let Some(stopped) =
-            waiter.wait(next, &mut || stop_check(settings, started, rx, enigo, sink))
+            waiter.wait(next, &mut || stop_check(settings, started, rx, input, sink))
         {
             reason = Some(stopped);
         }
@@ -413,30 +408,30 @@ impl From<MouseButton> for Button {
 
 /// Moves (when needed) and clicks. Kept panic-free: the pointer is only ever
 /// left pressed for the duration of this call.
-fn perform_click(enigo: &mut Enigo, settings: &Settings, target: (i32, i32)) -> InputResult<()> {
+fn perform_click(input: &mut Input, settings: &Settings, target: (i32, i32)) -> Result<(), String> {
     let needs_move = settings.position == PositionMode::Fixed || settings.jitter != JitterMode::Off;
     if needs_move {
-        enigo.move_mouse(target.0, target.1, Coordinate::Abs)?;
+        input.move_abs(target.0, target.1)?;
     }
     let button = Button::from(settings.button);
     match settings.style {
-        ClickStyle::Single => press_release(enigo, button),
+        ClickStyle::Single => press_release(input, button),
         ClickStyle::Hold => {
-            enigo.button(button, Direction::Press)?;
+            input.button(button, Direction::Press)?;
             thread::sleep(Duration::from_millis(settings.hold_ms as u64));
-            enigo.button(button, Direction::Release)
+            input.button(button, Direction::Release)
         }
         ClickStyle::Double => {
-            press_release(enigo, button)?;
+            press_release(input, button)?;
             thread::sleep(DOUBLE_GAP);
-            press_release(enigo, button)
+            press_release(input, button)
         }
     }
 }
 
-fn press_release(enigo: &mut Enigo, button: Button) -> InputResult<()> {
-    enigo.button(button, Direction::Press)?;
-    enigo.button(button, Direction::Release)
+fn press_release(input: &mut Input, button: Button) -> Result<(), String> {
+    input.button(button, Direction::Press)?;
+    input.button(button, Direction::Release)
 }
 
 /// Draws the click interval for one trigger.
