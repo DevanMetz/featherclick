@@ -12,6 +12,8 @@ mod hotkeys;
 mod icon;
 mod platform;
 mod ui;
+#[cfg(target_os = "linux")]
+mod wayland_probe;
 
 use std::process::ExitCode;
 
