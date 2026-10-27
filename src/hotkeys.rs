@@ -113,13 +113,15 @@ pub fn is_press(event: &GlobalHotKeyEvent) -> bool {
 /// X11 auto-repeat is the reason this exists: the server emits a *pair* of
 /// events (KeyRelease immediately followed by KeyPress) on every repeat tick,
 /// so a held hotkey would otherwise re-fire forever and a held toggle would
-/// flap. Windows and macOS send a single press, so the same gate covers both
-/// without a timer.
+/// flap. Windows and macOS send repeated presses with no release in between.
+/// Each binding is tracked on its own: a release of one key must not rearm
+/// the other, or tapping pick-position while start/stop is held toggles twice.
 pub struct Gate {
-    /// Binding whose press was accepted and whose release has not arrived yet.
-    held: Option<u32>,
-    /// Last release seen, used to recognise the repeat signature.
-    released: Option<(u32, Instant)>,
+    /// Bindings whose press was accepted and whose release has not arrived.
+    held: Vec<u32>,
+    /// Latest release of each binding, so a repeat pair is still recognised
+    /// when another key's events land between the two halves.
+    released: Vec<(u32, Instant)>,
 }
 
 /// A release/press pair closer together than this is auto-repeat, not a tap.
@@ -130,28 +132,43 @@ const REPEAT_PAIR_GAP: Duration = Duration::from_millis(25);
 impl Gate {
     pub fn new() -> Self {
         Self {
-            held: None,
-            released: None,
+            held: Vec::new(),
+            released: Vec::new(),
         }
     }
 
     /// Feeds one event in; returns `true` when it should trigger its action.
     pub fn accept(&mut self, id: u32, pressed: bool, now: Instant) -> bool {
+        self.released
+            .retain(|(_, at)| now.saturating_duration_since(*at) < REPEAT_PAIR_GAP);
         if !pressed {
-            self.held = None;
-            self.released = Some((id, now));
+            self.held.retain(|held| *held != id);
+            self.note_release(id, now);
             return false;
         }
-        let is_repeat = self.released.is_some_and(|(released_id, at)| {
-            released_id == id && now.duration_since(at) < REPEAT_PAIR_GAP
+        let is_repeat = self.released.iter().any(|(released_id, at)| {
+            *released_id == id && now.saturating_duration_since(*at) < REPEAT_PAIR_GAP
         });
-        if self.held == Some(id) || is_repeat {
-            // Track repeats as held so the whole burst stays suppressed.
-            self.held = Some(id);
+        if self.held.contains(&id) || is_repeat {
+            self.hold(id);
             return false;
         }
-        self.held = Some(id);
+        self.hold(id);
         true
+    }
+
+    fn hold(&mut self, id: u32) {
+        if !self.held.contains(&id) {
+            self.held.push(id);
+        }
+    }
+
+    fn note_release(&mut self, id: u32, now: Instant) {
+        if let Some(slot) = self.released.iter_mut().find(|(seen, _)| *seen == id) {
+            slot.1 = now;
+        } else {
+            self.released.push((id, now));
+        }
     }
 }
 
@@ -285,6 +302,49 @@ mod tests {
         // ...and once really released, the next tap works again.
         assert!(!gate.accept(3, false, start + Duration::from_millis(1600)));
         assert!(gate.accept(3, true, start + Duration::from_millis(2000)));
+    }
+
+    #[test]
+    fn gate_does_not_rearm_a_held_key_when_another_key_is_tapped() {
+        let mut gate = Gate::new();
+        let start = Instant::now();
+        assert!(gate.accept(7, true, start), "start/stop must trigger");
+        // Windows repeat: more presses, no release.
+        assert!(!gate.accept(7, true, start + Duration::from_millis(500)));
+
+        // Tap pick-position while start/stop is still held.
+        assert!(gate.accept(8, true, start + Duration::from_millis(600)));
+        assert!(!gate.accept(8, false, start + Duration::from_millis(650)));
+
+        assert!(
+            !gate.accept(7, true, start + Duration::from_millis(700)),
+            "the held toggle must not fire again after the other key's release"
+        );
+        assert!(!gate.accept(7, true, start + Duration::from_millis(733)));
+
+        assert!(!gate.accept(7, false, start + Duration::from_millis(900)));
+        assert!(
+            gate.accept(7, true, start + Duration::from_millis(1200)),
+            "a later tap must trigger"
+        );
+    }
+
+    #[test]
+    fn gate_keeps_an_x11_repeat_pair_when_another_release_lands_between() {
+        let mut gate = Gate::new();
+        let start = Instant::now();
+        assert!(gate.accept(7, true, start));
+        assert!(gate.accept(8, true, start + Duration::from_millis(100)));
+
+        // Release of 7, then a release of 8, then the repeat press of 7.
+        // The pair is still a repeat of 7 even though 8 was the latest release.
+        let at = start + Duration::from_millis(200);
+        assert!(!gate.accept(7, false, at));
+        assert!(!gate.accept(8, false, at + Duration::from_millis(1)));
+        assert!(
+            !gate.accept(7, true, at + Duration::from_millis(2)),
+            "the repeat press of the held key must stay suppressed"
+        );
     }
 
     #[test]
