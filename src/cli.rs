@@ -233,7 +233,7 @@ impl Run {
             SessionEvent::Started => {}
         };
 
-        engine::run_session(&settings, &commands, &mut enigo, &mut sink);
+        engine::run_session(&settings, &commands, &mut enigo, &mut sink, &|| false);
 
         let elapsed = start.elapsed().as_secs_f64();
         let reason = stopped.unwrap_or(StopReason::Shutdown);
