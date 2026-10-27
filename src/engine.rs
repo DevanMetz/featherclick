@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use enigo::{Button, Coordinate, Direction, Enigo, InputResult, Mouse, Settings as EnigoSettings};
+use enigo::{Button, Coordinate, Direction, Enigo, Mouse, Settings as EnigoSettings};
 
 use crate::config::{ClickStyle, JitterMode, MouseButton, PositionMode, Settings, TimingMode};
 
@@ -164,9 +164,61 @@ impl Worker {
     }
 }
 
-/// Connects to the platform input backend. Boxed error text is what the user
+/// The input backend for one process. Windows and an X11 or wlroots session
+/// use enigo. A Wayland session without a virtual pointer uses the remote
+/// desktop portal, and falls back to enigo when that portal cannot be used.
+pub(crate) enum Input {
+    Enigo(Enigo),
+    #[cfg(target_os = "linux")]
+    Portal(crate::portal::PortalPointer),
+}
+
+impl Input {
+    fn button(&mut self, button: Button, direction: Direction) -> Result<(), String> {
+        match self {
+            Self::Enigo(enigo) => enigo
+                .button(button, direction)
+                .map_err(|err| err.to_string()),
+            #[cfg(target_os = "linux")]
+            Self::Portal(portal) => portal.button(button, direction),
+        }
+    }
+
+    fn move_abs(&mut self, x: i32, y: i32) -> Result<(), String> {
+        match self {
+            Self::Enigo(enigo) => enigo
+                .move_mouse(x, y, Coordinate::Abs)
+                .map_err(|err| err.to_string()),
+            #[cfg(target_os = "linux")]
+            Self::Portal(portal) => portal.move_abs(x, y),
+        }
+    }
+
+    fn location(&mut self) -> Result<(i32, i32), String> {
+        match self {
+            Self::Enigo(enigo) => enigo.location().map_err(|err| err.to_string()),
+            #[cfg(target_os = "linux")]
+            Self::Portal(portal) => portal.location(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_portal(&self) -> bool {
+        matches!(self, Self::Portal(_))
+    }
+}
+
+/// Connects to the platform input backend. The error text is what the user
 /// needs on a headless Linux box with no X11/Wayland session.
-pub fn connect() -> Result<Enigo, String> {
+pub(crate) fn connect() -> Result<Input, String> {
+    #[cfg(target_os = "linux")]
+    if crate::wayland_probe::prefer_portal() {
+        return connect_portal_or_enigo();
+    }
+    connect_enigo().map(Input::Enigo)
+}
+
+fn connect_enigo() -> Result<Enigo, String> {
     let settings = EnigoSettings {
         // Every extra millisecond of per-event delay is a millisecond off the
         // achievable click rate.
@@ -176,12 +228,48 @@ pub fn connect() -> Result<Enigo, String> {
     Enigo::new(&settings).map_err(|err| format!("cannot simulate input: {err}"))
 }
 
-fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
-    let mut enigo = connect().ok();
-    if enigo.is_none() {
-        let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
-        guard.error = connect().err();
+#[cfg(target_os = "linux")]
+fn connect_portal_or_enigo() -> Result<Input, String> {
+    match crate::portal::PortalPointer::open() {
+        Ok(portal) => Ok(Input::Portal(portal)),
+        Err(portal_err) => connect_enigo().map(Input::Enigo).map_err(|_| portal_err),
     }
+}
+
+/// The portal dialog waits for the first run. Opening the window, or picking
+/// a point, must not ask for remote-desktop permission.
+fn defer_portal() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::wayland_probe::prefer_portal()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+fn ensure_input(input: &mut Option<Input>) -> Result<(), String> {
+    if input.is_some() {
+        return Ok(());
+    }
+    *input = Some(connect()?);
+    Ok(())
+}
+
+fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
+    let mut input = if defer_portal() {
+        None
+    } else {
+        match connect() {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
+                guard.error = Some(err);
+                None
+            }
+        }
+    };
 
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
@@ -190,11 +278,17 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
             Ok(Command::Shutdown) => break,
             Ok(Command::Stop) => {}
             Ok(Command::Capture) => {
-                // Retry the connection: a display may have appeared since launch.
-                if enigo.is_none() {
-                    enigo = connect().ok();
+                if input.is_none() && defer_portal() {
+                    capture_deferred(status);
+                    continue;
                 }
-                if let Some(handle) = enigo.as_mut() {
+                // Retry the connection: a display may have appeared since launch.
+                if let Err(err) = ensure_input(&mut input) {
+                    let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.error = Some(err);
+                    continue;
+                }
+                if let Some(handle) = input.as_mut() {
                     capture(handle, &mut |event| apply(status, event));
                 }
             }
@@ -203,22 +297,28 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
                 if !idle {
                     continue;
                 }
-                if enigo.is_none() {
-                    enigo = connect().ok();
+                if let Err(err) = ensure_input(&mut input) {
+                    let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.error = Some(err);
+                    continue;
                 }
-                match enigo.as_mut() {
-                    None => {
-                        let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.error = connect().err();
-                    }
-                    Some(handle) => {
-                        run_session(&settings, rx, handle, &mut |event| apply(status, event));
-                    }
+                if let Some(handle) = input.as_mut() {
+                    run_session(&settings, rx, handle, &mut |event| apply(status, event));
                 }
             }
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+fn capture_deferred(status: &Arc<Mutex<Status>>) {
+    if let Ok(point) = crate::portal::read_cursor() {
+        apply(status, SessionEvent::Captured(point));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn capture_deferred(_status: &Arc<Mutex<Status>>) {}
 
 /// Applies a session event to the shared status. Kept out of `Worker` so the
 /// worker thread can use it without cloning the handle.
@@ -246,8 +346,8 @@ fn apply(status: &Arc<Mutex<Status>>, event: SessionEvent) {
     }
 }
 
-fn capture(enigo: &mut Enigo, sink: &mut dyn FnMut(SessionEvent)) {
-    if let Ok(point) = enigo.location() {
+fn capture(input: &mut Input, sink: &mut dyn FnMut(SessionEvent)) {
+    if let Ok(point) = input.location() {
         sink(SessionEvent::Captured(point));
     }
 }
@@ -258,14 +358,14 @@ enum Polled {
     Stop(StopReason),
 }
 
-fn poll(rx: &Receiver<Command>, enigo: &mut Enigo, sink: &mut dyn FnMut(SessionEvent)) -> Polled {
+fn poll(rx: &Receiver<Command>, input: &mut Input, sink: &mut dyn FnMut(SessionEvent)) -> Polled {
     loop {
         match rx.try_recv() {
             Err(TryRecvError::Empty) => return Polled::Continue,
             Err(TryRecvError::Disconnected) => return Polled::Stop(StopReason::Shutdown),
             Ok(Command::Stop) | Ok(Command::Toggle(_)) => return Polled::Stop(StopReason::User),
             Ok(Command::Shutdown) => return Polled::Stop(StopReason::Shutdown),
-            Ok(Command::Capture) => capture(enigo, sink),
+            Ok(Command::Capture) => capture(input, sink),
             // Already running; a second Start is a no-op.
             Ok(Command::Start(_)) => {}
         }
@@ -278,13 +378,13 @@ fn stop_check(
     settings: &Settings,
     started: Instant,
     rx: &Receiver<Command>,
-    enigo: &mut Enigo,
+    input: &mut Input,
     sink: &mut dyn FnMut(SessionEvent),
 ) -> Option<StopReason> {
     if time_limit_reached(settings, started.elapsed()) {
         return Some(StopReason::TimeLimit);
     }
-    match poll(rx, enigo, sink) {
+    match poll(rx, input, sink) {
         Polled::Continue => None,
         Polled::Stop(reason) => Some(reason),
     }
@@ -303,7 +403,7 @@ fn time_limit_reached(settings: &Settings, elapsed: Duration) -> bool {
 pub(crate) fn run_session(
     settings: &Settings,
     rx: &Receiver<Command>,
-    enigo: &mut Enigo,
+    input: &mut Input,
     sink: &mut dyn FnMut(SessionEvent),
 ) {
     let _timer = crate::platform::TimerResolution::acquire();
@@ -318,17 +418,18 @@ pub(crate) fn run_session(
     if settings.start_delay_ms > 0 {
         let deadline = started + Duration::from_millis(settings.start_delay_ms as u64);
         if let Some(stopped) = waiter.wait(deadline, &mut || {
-            stop_check(settings, started, rx, enigo, sink)
+            stop_check(settings, started, rx, input, sink)
         }) {
             reason = Some(stopped);
         }
     }
 
     // Where jitter is measured from: captured once, so repeated clicks never
-    // drift away from the intended spot.
+    // drift away from the intended spot. A portal session that cannot see the
+    // seat cursor clicks in place rather than jumping to the saved point.
     let anchor = match settings.position {
-        PositionMode::Fixed => settings.point,
-        PositionMode::Cursor => enigo.location().unwrap_or(settings.point),
+        PositionMode::Fixed => Some(settings.point),
+        PositionMode::Cursor => remembered_cursor(input, settings.point),
     };
 
     let mut next = Instant::now();
@@ -342,10 +443,9 @@ pub(crate) fn run_session(
             break;
         }
 
-        let target = target_point(settings, anchor);
-        if let Err(err) = perform_click(enigo, settings, target) {
-            let message = err.to_string();
-            reason = Some(StopReason::Error(message));
+        let target = anchor.map(|point| target_point(settings, point));
+        if let Err(err) = perform_click(input, settings, target) {
+            reason = Some(StopReason::Error(err));
             break;
         }
         clicks += presses_per_trigger(settings.style);
@@ -358,10 +458,12 @@ pub(crate) fn run_session(
             break;
         }
 
-        if settings.stop_on_move_px > 0 {
-            let moved = enigo
+        if settings.stop_on_move_px > 0
+            && let Some(aimed) = target
+        {
+            let moved = input
                 .location()
-                .map(|now| distance(now, target) > settings.stop_on_move_px as i32)
+                .map(|now| distance(now, aimed) > settings.stop_on_move_px as i32)
                 .unwrap_or(false);
             if moved {
                 reason = Some(StopReason::MouseMoved);
@@ -377,7 +479,7 @@ pub(crate) fn run_session(
             next = now;
         }
         if let Some(stopped) =
-            waiter.wait(next, &mut || stop_check(settings, started, rx, enigo, sink))
+            waiter.wait(next, &mut || stop_check(settings, started, rx, input, sink))
         {
             reason = Some(stopped);
         }
@@ -411,32 +513,52 @@ impl From<MouseButton> for Button {
     }
 }
 
-/// Moves (when needed) and clicks. Kept panic-free: the pointer is only ever
-/// left pressed for the duration of this call.
-fn perform_click(enigo: &mut Enigo, settings: &Settings, target: (i32, i32)) -> InputResult<()> {
-    let needs_move = settings.position == PositionMode::Fixed || settings.jitter != JitterMode::Off;
-    if needs_move {
-        enigo.move_mouse(target.0, target.1, Coordinate::Abs)?;
-    }
-    let button = Button::from(settings.button);
-    match settings.style {
-        ClickStyle::Single => press_release(enigo, button),
-        ClickStyle::Hold => {
-            enigo.button(button, Direction::Press)?;
-            thread::sleep(Duration::from_millis(settings.hold_ms as u64));
-            enigo.button(button, Direction::Release)
-        }
-        ClickStyle::Double => {
-            press_release(enigo, button)?;
-            thread::sleep(DOUBLE_GAP);
-            press_release(enigo, button)
+/// The cursor, when it can be read. Enigo falls back to the saved point, which
+/// is where a fixed target already lives. The portal must not invent that
+/// point: with no XWayland position it clicks wherever the seat cursor is.
+fn remembered_cursor(input: &mut Input, fallback: (i32, i32)) -> Option<(i32, i32)> {
+    match input.location() {
+        Ok(point) => Some(point),
+        Err(_) => {
+            #[cfg(target_os = "linux")]
+            if input.is_portal() {
+                return None;
+            }
+            Some(fallback)
         }
     }
 }
 
-fn press_release(enigo: &mut Enigo, button: Button) -> InputResult<()> {
-    enigo.button(button, Direction::Press)?;
-    enigo.button(button, Direction::Release)
+/// Moves (when needed) and clicks. Kept panic-free: the pointer is only ever
+/// left pressed for the duration of this call.
+fn perform_click(
+    input: &mut Input,
+    settings: &Settings,
+    target: Option<(i32, i32)>,
+) -> Result<(), String> {
+    let needs_move = settings.position == PositionMode::Fixed || settings.jitter != JitterMode::Off;
+    if needs_move && let Some((x, y)) = target {
+        input.move_abs(x, y)?;
+    }
+    let button = Button::from(settings.button);
+    match settings.style {
+        ClickStyle::Single => press_release(input, button),
+        ClickStyle::Hold => {
+            input.button(button, Direction::Press)?;
+            thread::sleep(Duration::from_millis(settings.hold_ms as u64));
+            input.button(button, Direction::Release)
+        }
+        ClickStyle::Double => {
+            press_release(input, button)?;
+            thread::sleep(DOUBLE_GAP);
+            press_release(input, button)
+        }
+    }
+}
+
+fn press_release(input: &mut Input, button: Button) -> Result<(), String> {
+    input.button(button, Direction::Press)?;
+    input.button(button, Direction::Release)
 }
 
 /// Draws the click interval for one trigger.

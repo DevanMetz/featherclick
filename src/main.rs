@@ -11,6 +11,8 @@ mod engine;
 mod hotkeys;
 mod icon;
 mod platform;
+#[cfg(target_os = "linux")]
+mod portal;
 mod ui;
 #[cfg(target_os = "linux")]
 mod wayland_probe;
