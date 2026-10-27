@@ -164,24 +164,95 @@ impl Worker {
     }
 }
 
-/// Connects to the platform input backend. Boxed error text is what the user
-/// needs on a headless Linux box with no X11/Wayland session.
-pub fn connect() -> Result<Enigo, String> {
-    let settings = EnigoSettings {
+/// Display name that is not a parseable X11 display and not a Wayland socket.
+/// Passing it forces that one backend to fail immediately, so the other is
+/// the only connection enigo keeps.
+const ISOLATED_DISPLAY: &str = "featherclick-no-display";
+
+/// One attempt to open an input connection.
+///
+/// `None` leaves that server to the environment. `Some` forces the name enigo
+/// will try, which is how a backend is kept out of the connection.
+struct BackendAttempt {
+    wayland_display: Option<String>,
+    x11_display: Option<String>,
+}
+
+/// Servers to try, in order. Each attempt leaves at most one of the two open.
+///
+/// enigo sends every click to every server it connected, so a session where
+/// both Wayland and XWayland answered would click twice. The first attempt is
+/// Wayland alone, and only when `WAYLAND_DISPLAY` is set; the last is X11
+/// alone, which is also the path on Windows and macOS (those fields are
+/// ignored there).
+fn backend_attempts(wayland_is_set: bool) -> Vec<BackendAttempt> {
+    let mut attempts = Vec::new();
+    if wayland_is_set {
+        attempts.push(BackendAttempt {
+            wayland_display: None,
+            x11_display: Some(ISOLATED_DISPLAY.to_string()),
+        });
+    }
+    attempts.push(BackendAttempt {
+        wayland_display: Some(ISOLATED_DISPLAY.to_string()),
+        x11_display: None,
+    });
+    attempts
+}
+
+fn enigo_settings(attempt: &BackendAttempt) -> EnigoSettings {
+    EnigoSettings {
         // Every extra millisecond of per-event delay is a millisecond off the
         // achievable click rate.
         linux_delay: 0,
+        wayland_display: attempt.wayland_display.clone(),
+        x11_display: attempt.x11_display.clone(),
         ..EnigoSettings::default()
-    };
-    Enigo::new(&settings).map_err(|err| format!("cannot simulate input: {err}"))
+    }
+}
+
+/// Connects to one platform input backend.
+pub fn connect() -> Result<Enigo, String> {
+    #[cfg(target_os = "linux")]
+    let wayland_is_set = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    #[cfg(not(target_os = "linux"))]
+    let wayland_is_set = false;
+
+    let mut last_err = String::from("no display");
+    for attempt in backend_attempts(wayland_is_set) {
+        match Enigo::new(&enigo_settings(&attempt)) {
+            Ok(enigo) => return Ok(enigo),
+            Err(err) => last_err = err.to_string(),
+        }
+    }
+    Err(format!("cannot simulate input: {last_err}"))
+}
+
+/// Opens the input backend if a previous attempt failed. One connection
+/// attempt per call: the error from that attempt is what the UI shows.
+fn ensure_input<'a>(
+    enigo: &'a mut Option<Enigo>,
+    status: &Arc<Mutex<Status>>,
+) -> Option<&'a mut Enigo> {
+    if enigo.is_none() {
+        match connect() {
+            Ok(handle) => *enigo = Some(handle),
+            Err(err) => {
+                status.lock().unwrap_or_else(|e| e.into_inner()).error = Some(err);
+            }
+        }
+    }
+    enigo.as_mut()
 }
 
 fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
-    let mut enigo = connect().ok();
-    if enigo.is_none() {
-        let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
-        guard.error = connect().err();
-    }
+    let mut enigo = match connect() {
+        Ok(enigo) => Some(enigo),
+        Err(err) => {
+            status.lock().unwrap_or_else(|e| e.into_inner()).error = Some(err);
+            None
+        }
+    };
 
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
@@ -191,10 +262,7 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
             Ok(Command::Stop) => {}
             Ok(Command::Capture) => {
                 // Retry the connection: a display may have appeared since launch.
-                if enigo.is_none() {
-                    enigo = connect().ok();
-                }
-                if let Some(handle) = enigo.as_mut() {
+                if let Some(handle) = ensure_input(&mut enigo, status) {
                     capture(handle, &mut |event| apply(status, event));
                 }
             }
@@ -203,17 +271,8 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
                 if !idle {
                     continue;
                 }
-                if enigo.is_none() {
-                    enigo = connect().ok();
-                }
-                match enigo.as_mut() {
-                    None => {
-                        let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.error = connect().err();
-                    }
-                    Some(handle) => {
-                        run_session(&settings, rx, handle, &mut |event| apply(status, event));
-                    }
+                if let Some(handle) = ensure_input(&mut enigo, status) {
+                    run_session(&settings, rx, handle, &mut |event| apply(status, event));
                 }
             }
         }
@@ -743,5 +802,31 @@ mod tests {
             start.elapsed() < Duration::from_secs(1),
             "a stop must not wait out a 30s interval"
         );
+    }
+
+    #[test]
+    fn each_connection_attempt_opens_at_most_one_server() {
+        let wayland = backend_attempts(true);
+        assert_eq!(wayland.len(), 2, "Wayland is tried before X11");
+        assert!(
+            wayland[0].wayland_display.is_none() && wayland[0].x11_display.is_some(),
+            "the first attempt must not also open X11"
+        );
+        assert!(
+            wayland[1].wayland_display.is_some() && wayland[1].x11_display.is_none(),
+            "the X11 fallback must not also open Wayland"
+        );
+
+        let x11_only = backend_attempts(false);
+        assert_eq!(x11_only.len(), 1);
+        assert!(x11_only[0].wayland_display.is_some());
+        assert!(x11_only[0].x11_display.is_none());
+
+        for attempt in wayland.iter().chain(&x11_only) {
+            assert!(
+                attempt.wayland_display.is_some() || attempt.x11_display.is_some(),
+                "an attempt that names neither server is how both end up connected"
+            );
+        }
     }
 }
