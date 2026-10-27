@@ -1,16 +1,75 @@
 //! Global hotkey registration.
 //!
-//! The manager must live on the thread that owns the platform event loop
-//! (required by the Windows and macOS backends), so it is created in
-//! `App::new`, which eframe runs on the main thread. Events themselves are
-//! delivered on a process-wide channel that any thread may read.
+//! Windows, macOS, and X11 grabs must be created on the thread that owns the
+//! platform event loop, so `Hotkeys` is built in `App::new`. A Wayland session
+//! reads the keyboard device instead. Both publish on one channel, which the
+//! notifier thread reads.
 
 use std::str::FromStr;
+use std::sync::mpsc::{Receiver, RecvError, Sender, channel};
+use std::sync::{Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 pub use global_hotkey::GlobalHotKeyEvent;
 use global_hotkey::hotkey::{HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyManager, HotKeyState};
+
+#[cfg(target_os = "linux")]
+#[path = "evdev_keys.rs"]
+mod evdev_keys;
+
+/// A press or release of a registered chord, from whichever backend is in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotkeyEvent {
+    pub id: u32,
+    pub pressed: bool,
+}
+
+// `Receiver` is `Send` but not `Sync`, so it cannot sit in a `OnceLock` by
+// itself. The notifier is the only reader and holds the mutex across `recv`.
+// Publishers only touch the sender.
+static TX: OnceLock<Sender<HotkeyEvent>> = OnceLock::new();
+static RX: OnceLock<Mutex<Receiver<HotkeyEvent>>> = OnceLock::new();
+
+fn ensure_bus() {
+    let _ = TX.get_or_init(|| {
+        let (tx, rx) = channel();
+        let _ = RX.set(Mutex::new(rx));
+        tx
+    });
+}
+
+/// Blocks until the next chord edge. The notifier thread is the only caller.
+pub fn recv_event() -> Result<HotkeyEvent, RecvError> {
+    ensure_bus();
+    RX.get()
+        .expect("hotkey receiver")
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .recv()
+}
+
+fn publish(id: u32, pressed: bool) {
+    ensure_bus();
+    let _ = TX
+        .get()
+        .expect("hotkey sender")
+        .send(HotkeyEvent { id, pressed });
+}
+
+fn ensure_forwarder() {
+    static START: Once = Once::new();
+    START.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("featherclick-grab".to_string())
+            .spawn(|| {
+                let incoming = GlobalHotKeyEvent::receiver();
+                while let Ok(event) = incoming.recv() {
+                    publish(event.id, is_press(&event));
+                }
+            });
+    });
+}
 
 /// What a registered hotkey does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,17 +94,40 @@ pub fn invalid(text: &str) -> bool {
     !text.trim().is_empty() && parse(text).is_none()
 }
 
+enum Backend {
+    Grab(GlobalHotKeyManager),
+    /// Wayland sessions. An X11 grab does not see keys typed into native
+    /// windows, even when XWayland has set `DISPLAY`.
+    #[cfg(target_os = "linux")]
+    Devices(evdev_keys::Listener),
+}
+
 pub struct Hotkeys {
-    manager: GlobalHotKeyManager,
+    backend: Backend,
     toggle: Option<HotKey>,
     capture: Option<HotKey>,
 }
 
 impl Hotkeys {
     pub fn new() -> Result<Self, String> {
+        #[cfg(target_os = "linux")]
+        if evdev_keys::session_is_wayland(
+            std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+            std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+        ) {
+            // Do not fall back to the X11 grab: it registers successfully and
+            // then never fires, which looks like a working hotkey.
+            let listener = evdev_keys::Listener::start(publish)?;
+            return Ok(Self {
+                backend: Backend::Devices(listener),
+                toggle: None,
+                capture: None,
+            });
+        }
+        ensure_forwarder();
         GlobalHotKeyManager::new()
             .map(|manager| Self {
-                manager,
+                backend: Backend::Grab(manager),
                 toggle: None,
                 capture: None,
             })
@@ -55,26 +137,32 @@ impl Hotkeys {
     /// Replaces every binding. Returns a message when one could not be
     /// registered, which in practice means another application owns it.
     pub fn apply(&mut self, toggle: Option<HotKey>, capture: Option<HotKey>) -> Option<String> {
-        for hotkey in [self.toggle, self.capture].into_iter().flatten() {
-            let _ = self.manager.unregister(hotkey);
-        }
-        self.toggle = None;
-        self.capture = None;
-
-        let mut problem = None;
-        for (action, hotkey) in [(Action::Toggle, toggle), (Action::Capture, capture)] {
-            let Some(hotkey) = hotkey else { continue };
-            match self.manager.register(hotkey) {
-                Ok(()) => match action {
-                    Action::Toggle => self.toggle = Some(hotkey),
-                    Action::Capture => self.capture = Some(hotkey),
-                },
-                Err(err) => {
-                    problem.get_or_insert_with(|| format!("{hotkey} unavailable: {err}"));
+        match &mut self.backend {
+            Backend::Grab(manager) => {
+                for hotkey in [self.toggle, self.capture].into_iter().flatten() {
+                    let _ = manager.unregister(hotkey);
                 }
+                self.toggle = None;
+                self.capture = None;
+
+                let mut problem = None;
+                for (action, hotkey) in [(Action::Toggle, toggle), (Action::Capture, capture)] {
+                    let Some(hotkey) = hotkey else { continue };
+                    match manager.register(hotkey) {
+                        Ok(()) => match action {
+                            Action::Toggle => self.toggle = Some(hotkey),
+                            Action::Capture => self.capture = Some(hotkey),
+                        },
+                        Err(err) => {
+                            problem.get_or_insert_with(|| format!("{hotkey} unavailable: {err}"));
+                        }
+                    }
+                }
+                problem
             }
+            #[cfg(target_os = "linux")]
+            Backend::Devices(listener) => listener.set(toggle, capture),
         }
-        problem
     }
 }
 
@@ -161,10 +249,10 @@ impl Default for Gate {
     }
 }
 
-/// True when `event` is the toggle binding of `settings`, resolved from the
-/// config text so the notifier thread needs no shared manager state.
-pub fn matches(event: &GlobalHotKeyEvent, text: &str) -> bool {
-    parse(text).is_some_and(|hotkey| hotkey.id() == event.id)
+/// True when `id` is the binding stored in `text`, resolved from the config
+/// string so the notifier thread needs no shared manager state.
+pub fn matches(id: u32, text: &str) -> bool {
+    parse(text).is_some_and(|hotkey| hotkey.id() == id)
 }
 
 pub use global_hotkey::hotkey::Code;
@@ -295,5 +383,26 @@ mod tests {
         assert!(gate.accept(5, true, start));
         assert!(!gate.accept(5, false, start + Duration::from_millis(50)));
         assert!(gate.accept(5, true, start + Duration::from_millis(600)));
+    }
+
+    #[test]
+    fn published_edges_reach_the_single_receiver() {
+        // The only test that reads the process-wide channel.
+        publish(42, true);
+        publish(42, false);
+        assert_eq!(
+            recv_event().unwrap(),
+            HotkeyEvent {
+                id: 42,
+                pressed: true
+            }
+        );
+        assert_eq!(
+            recv_event().unwrap(),
+            HotkeyEvent {
+                id: 42,
+                pressed: false
+            }
+        );
     }
 }

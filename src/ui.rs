@@ -14,7 +14,7 @@ use crate::config::{
     self, ClickStyle, JitterMode, MouseButton, PositionMode, Settings, Theme, TimingMode,
 };
 use crate::engine::{Status, Worker};
-use crate::hotkeys::{self, Action, Code, Gate, GlobalHotKeyEvent, Hotkeys};
+use crate::hotkeys::{self, Action, Code, Gate, Hotkeys};
 
 const ACCENT: Color32 = Color32::from_rgb(0x4C, 0x8D, 0xFF);
 const RUNNING: Color32 = Color32::from_rgb(0x4A, 0xD0, 0x8C);
@@ -51,8 +51,8 @@ impl App {
         let worker = Worker::spawn();
         let shared = Arc::new(Mutex::new(settings.clone()));
 
-        // Both hotkey backends require the thread that owns the event loop, and
-        // `App::new` runs on it.
+        // Windows, macOS, and X11 grabs must be created on the event-loop
+        // thread. `App::new` runs on it.
         let (hotkeys, creation_error) = match Hotkeys::new() {
             Ok(manager) => (Some(manager), None),
             Err(err) => (None, Some(err)),
@@ -293,7 +293,7 @@ impl App {
                 let mut hints = Vec::new();
                 if running {
                     hints.push("changes apply on the next start".to_string());
-                } else if !self.settings.hotkey_toggle.trim().is_empty() {
+                } else if self.hotkeys.is_some() && !self.settings.hotkey_toggle.trim().is_empty() {
                     hints.push(format!(
                         "{} toggles",
                         hotkeys::pretty(&self.settings.hotkey_toggle)
@@ -759,16 +759,15 @@ fn spawn_notifier(ctx: egui::Context, worker: Worker, shared: Arc<Mutex<Settings
     let spawned = std::thread::Builder::new()
         .name("featherclick-hotkeys".to_string())
         .spawn(move || {
-            let events = GlobalHotKeyEvent::receiver();
             let mut gate = Gate::new();
-            while let Ok(event) = events.recv() {
-                if !gate.accept(event.id, hotkeys::is_press(&event), Instant::now()) {
+            while let Ok(event) = hotkeys::recv_event() {
+                if !gate.accept(event.id, event.pressed, Instant::now()) {
                     continue;
                 }
                 let snapshot = shared.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                if hotkeys::matches(&event, &snapshot.hotkey_toggle) {
+                if hotkeys::matches(event.id, &snapshot.hotkey_toggle) {
                     worker.toggle(&snapshot);
-                } else if hotkeys::matches(&event, &snapshot.hotkey_capture) {
+                } else if hotkeys::matches(event.id, &snapshot.hotkey_capture) {
                     worker.capture_cursor();
                 }
                 ctx.request_repaint();
