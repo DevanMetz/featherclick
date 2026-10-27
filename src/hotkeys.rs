@@ -43,6 +43,10 @@ pub struct Hotkeys {
 
 impl Hotkeys {
     pub fn new() -> Result<Self, String> {
+        // The Linux backend reports success when its X11 thread dies during
+        // connect, so a missing display has to be refused before it is created.
+        #[cfg(target_os = "linux")]
+        ensure_x11_hotkeys()?;
         GlobalHotKeyManager::new()
             .map(|manager| Self {
                 manager,
@@ -55,6 +59,7 @@ impl Hotkeys {
     /// Replaces every binding. Returns a message when one could not be
     /// registered, which in practice means another application owns it.
     pub fn apply(&mut self, toggle: Option<HotKey>, capture: Option<HotKey>) -> Option<String> {
+        let (toggle, capture, shared) = separate_duplicate(toggle, capture);
         for hotkey in [self.toggle, self.capture].into_iter().flatten() {
             let _ = self.manager.unregister(hotkey);
         }
@@ -74,7 +79,83 @@ impl Hotkeys {
                 }
             }
         }
+        if problem.is_none() {
+            problem = shared;
+        }
         problem
+    }
+}
+
+/// One key cannot be both actions: the backend rejects the second register
+/// and would only say so as a debug dump. Start/stop keeps the key.
+pub fn separate_duplicate(
+    toggle: Option<HotKey>,
+    capture: Option<HotKey>,
+) -> (Option<HotKey>, Option<HotKey>, Option<String>) {
+    match (toggle, capture) {
+        (Some(toggle), Some(capture)) if toggle.id() == capture.id() => {
+            let name = pretty(&toggle.to_string());
+            (
+                Some(toggle),
+                None,
+                Some(format!(
+                    "{name} is used by both start / stop and pick position"
+                )),
+            )
+        }
+        pair => (pair.0, pair.1, None),
+    }
+}
+
+/// `global-hotkey` on Linux is an X11 grab. `DISPLAY` of `:N` or `unix:N`
+/// listens on this socket; a TCP display has no socket here and is left for
+/// the backend to try.
+#[cfg(target_os = "linux")]
+fn x11_socket_path(display: &str) -> Option<std::path::PathBuf> {
+    let display = display.trim();
+    if display.is_empty() {
+        return None;
+    }
+    let rest = display.strip_prefix("unix:").unwrap_or(display);
+    let number = if let Some((host, number)) = rest.rsplit_once(':') {
+        if !host.is_empty() {
+            return None;
+        }
+        number
+    } else {
+        rest
+    };
+    let screen = number.split('.').next().unwrap_or("");
+    if screen.is_empty() || !screen.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(std::path::PathBuf::from(format!(
+        "/tmp/.X11-unix/X{screen}"
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_x11_hotkeys() -> Result<(), String> {
+    let display = std::env::var("DISPLAY").unwrap_or_default();
+    x11_hotkeys_from(&display, |path| {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    })
+}
+
+/// `open` reports whether the local socket accepts a connection. A TCP
+/// `DISPLAY` has no socket in `/tmp/.X11-unix` and is left for the backend.
+#[cfg(target_os = "linux")]
+fn x11_hotkeys_from(display: &str, open: impl Fn(&std::path::Path) -> bool) -> Result<(), String> {
+    if display.trim().is_empty() {
+        return Err("global hotkeys need an X11 display".to_string());
+    }
+    let Some(path) = x11_socket_path(display) else {
+        return Ok(());
+    };
+    if open(&path) {
+        Ok(())
+    } else {
+        Err("global hotkeys need an X11 display".to_string())
     }
 }
 
@@ -113,9 +194,9 @@ pub fn is_press(event: &GlobalHotKeyEvent) -> bool {
 /// X11 auto-repeat is the reason this exists: the server emits a *pair* of
 /// events (KeyRelease immediately followed by KeyPress) on every repeat tick,
 /// so a held hotkey would otherwise re-fire forever and a held toggle would
-/// flap. Windows and macOS send repeated presses with no release in between.
-/// Each binding is tracked on its own: a release of one key must not rearm
-/// the other, or tapping pick-position while start/stop is held toggles twice.
+/// flap. Windows and macOS send one press. Each binding is tracked on its
+/// own, because a release of the other key can land between the two halves
+/// of that pair and must not turn the repeat press into a new tap.
 pub struct Gate {
     /// Bindings whose press was accepted and whose release has not arrived.
     held: Vec<u32>,
@@ -505,7 +586,7 @@ mod tests {
         let mut gate = Gate::new();
         let start = Instant::now();
         assert!(gate.accept(7, true, start), "start/stop must trigger");
-        // Windows repeat: more presses, no release.
+        // Further presses with no release: a repeat that is not an X11 pair.
         assert!(!gate.accept(7, true, start + Duration::from_millis(500)));
 
         // Tap pick-position while start/stop is still held.
@@ -679,6 +760,56 @@ mod tests {
             ),
             CaptureResult::Binding(binding(Code::KeyV, false, false, false, true).to_string())
         );
+    }
+
+    #[test]
+    fn one_key_cannot_be_both_actions() {
+        let key = parse("F6").unwrap();
+        let (toggle, capture, problem) = separate_duplicate(Some(key), Some(key));
+        assert_eq!(toggle.map(|hotkey| hotkey.id()), Some(key.id()));
+        assert!(capture.is_none());
+        assert_eq!(
+            problem.as_deref(),
+            Some("F6 is used by both start / stop and pick position")
+        );
+
+        let other = parse("Ctrl+Shift+K").unwrap();
+        let (toggle, capture, problem) = separate_duplicate(Some(key), Some(other));
+        assert!(toggle.is_some() && capture.is_some() && problem.is_none());
+        assert_eq!(separate_duplicate(None, Some(key)), (None, Some(key), None));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn x11_socket_path_reads_a_local_display_number() {
+        assert_eq!(
+            x11_socket_path(":0").unwrap(),
+            std::path::PathBuf::from("/tmp/.X11-unix/X0")
+        );
+        assert_eq!(
+            x11_socket_path(":12.0").unwrap(),
+            std::path::PathBuf::from("/tmp/.X11-unix/X12")
+        );
+        assert_eq!(
+            x11_socket_path("unix:1").unwrap(),
+            std::path::PathBuf::from("/tmp/.X11-unix/X1")
+        );
+        assert_eq!(
+            x11_socket_path("  unix:3.0 ").unwrap(),
+            std::path::PathBuf::from("/tmp/.X11-unix/X3")
+        );
+        assert!(x11_socket_path("").is_none());
+        assert!(x11_socket_path("localhost:0").is_none());
+        assert!(x11_socket_path("localhost:0.0").is_none());
+        assert!(x11_socket_path(":").is_none());
+        assert!(x11_socket_path(":abc").is_none());
+
+        let err = x11_hotkeys_from("", |_| true).unwrap_err();
+        assert_eq!(err, "global hotkeys need an X11 display");
+        assert!(x11_hotkeys_from(":9", |_| false).is_err());
+        assert!(x11_hotkeys_from(":9", |_| true).is_ok());
+        // TCP displays are not probed through the unix socket.
+        assert!(x11_hotkeys_from("localhost:0", |_| false).is_ok());
     }
 
     #[test]

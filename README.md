@@ -74,8 +74,8 @@ portal client aborts the process when no portal is present, so it is
 deliberately not compiled in — a crash on launch is worse than a documented
 gap. On compositors without virtual-pointer support, clicks still reach
 XWayland applications. Wayland has no equivalent of X11's global grabs, so
-hotkeys are unavailable there and the on-screen buttons are the way to drive
-it.
+hotkeys are unavailable there. With no X11 display the window says so, and
+the on-screen buttons are the way to drive it.
 
 ## Using the window
 

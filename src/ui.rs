@@ -271,7 +271,9 @@ impl App {
                 let mut hints = Vec::new();
                 if running {
                     hints.push("changes apply on the next start".to_string());
-                } else if !self.settings.hotkey_toggle.trim().is_empty() {
+                } else if self.hotkey_error.is_none()
+                    && !self.settings.hotkey_toggle.trim().is_empty()
+                {
                     hints.push(format!(
                         "{} toggles",
                         hotkeys::pretty(&self.settings.hotkey_toggle)
