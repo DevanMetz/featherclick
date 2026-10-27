@@ -460,7 +460,7 @@ pub fn interval(settings: &Settings) -> Duration {
             if sigma <= 0.0 {
                 mean
             } else {
-                (mean + sigma * gaussian()).clamp(1.0, mean + 4.0 * sigma)
+                clamp_normal(mean, sigma, gaussian())
             }
         }
     };
@@ -510,6 +510,16 @@ pub fn target_point(settings: &Settings, anchor: (i32, i32)) -> (i32, i32) {
 
 fn clamp_sigma(value: f64) -> f64 {
     value.clamp(-3.0, 3.0)
+}
+
+/// One Gaussian draw, in milliseconds, kept inside ±4 sigma and at least 1.
+///
+/// Clamping only the top used to leave the bottom at 1 ms, so a draw could
+/// land far below `mean - 4 sigma`.
+fn clamp_normal(mean: f64, sigma: f64, z: f64) -> f64 {
+    let low = (mean - 4.0 * sigma).max(1.0);
+    let high = (mean + 4.0 * sigma).max(low);
+    (mean + sigma * z).clamp(low, high)
 }
 
 /// Standard normal sample (Box-Muller).
@@ -611,6 +621,43 @@ mod tests {
             assert!(secs >= 0.001, "{secs}s would spin the loop");
             assert!(secs <= 0.040, "{secs}s is beyond the +4 sigma clamp");
         }
+    }
+
+    #[test]
+    fn normal_timing_clamps_both_sides_of_the_four_sigma_window() {
+        // mean 100, sigma 10: the window is 60..=140, not 1..=140.
+        assert_eq!(clamp_normal(100.0, 10.0, 0.0), 100.0);
+        assert_eq!(clamp_normal(100.0, 10.0, -4.0), 60.0);
+        assert_eq!(clamp_normal(100.0, 10.0, 4.0), 140.0);
+        assert_eq!(
+            clamp_normal(100.0, 10.0, -100.0),
+            60.0,
+            "a deep tail must stop at mean - 4 sigma, not at 1 ms"
+        );
+        assert_eq!(clamp_normal(100.0, 10.0, 100.0), 140.0);
+        // Four sigma below this mean crosses 1 ms, so the floor applies.
+        assert_eq!(clamp_normal(100.0, 25.0, -100.0), 1.0);
+        assert_eq!(clamp_normal(100.0, 25.0, 100.0), 200.0);
+
+        let mut s = settings();
+        s.timing = TimingMode::Normal;
+        s.interval_mean_ms = 100;
+        s.interval_std_ms = 10;
+        let mut below_mean = false;
+        let mut above_mean = false;
+        for _ in 0..20_000 {
+            let ms = interval(&s).as_secs_f64() * 1000.0;
+            assert!(
+                (60.0 - 1e-6..=140.0 + 1e-6).contains(&ms),
+                "{ms} ms is outside mean ± 4 sigma"
+            );
+            below_mean |= ms < 90.0;
+            above_mean |= ms > 110.0;
+        }
+        assert!(
+            below_mean && above_mean,
+            "sigma of 10 ms should spread around the mean"
+        );
     }
 
     #[test]
