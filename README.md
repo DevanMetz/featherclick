@@ -64,7 +64,7 @@ install -Dm644 featherclick.png ~/.local/share/icons/hicolor/256x256/apps/feathe
 | | Windows 10/11 | macOS 11+ | Linux (X11) | Linux (Wayland) |
 | --- | --- | --- | --- | --- |
 | Clicking | ✅ | ✅ (Accessibility permission) | ✅ | ✅ wlroots only |
-| Global hotkeys | ✅ | ✅ | ✅ | ❌ — use the buttons |
+| Global hotkeys | ✅ | ✅ | ✅ | ✅ with access to `/dev/input` |
 | Picking a position | ✅ | ✅ | ✅ | ✅ |
 
 On Wayland, clicking uses the compositor's virtual-pointer protocol, which
@@ -73,9 +73,9 @@ covered: their only input path is the RemoteDesktop portal, and the upstream
 portal client aborts the process when no portal is present, so it is
 deliberately not compiled in — a crash on launch is worse than a documented
 gap. On compositors without virtual-pointer support, clicks still reach
-XWayland applications. Wayland has no equivalent of X11's global grabs, so
-hotkeys are unavailable there and the on-screen buttons are the way to drive
-it.
+XWayland applications. Hotkeys are read from `/dev/input/event*` (the `input`
+group on most distributions). Wayland has no per-key grab, so the focused
+window still receives the key.
 
 ## Using the window
 
@@ -245,8 +245,10 @@ virtual X display to prove the input backend actually connects.
 
 ## Limitations
 
-- Global hotkeys are implemented with OS-level registration: X11 only on Linux,
-  and the hotkey never reaches the focused application.
+- Global hotkeys use an OS-level grab on Windows, macOS, and X11, so the key
+  does not reach the focused application. On Wayland, FeatherClick reads
+  `/dev/input` instead (the `input` group), and the focused application still
+  receives the key.
 - No macro recording, sequences, or keyboard keys — FeatherClick clicks, and
   nothing else.
 - Windows and macOS builds are unsigned. Windows SmartScreen may warn on first

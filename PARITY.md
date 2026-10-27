@@ -1,6 +1,6 @@
 # Linux parity
 
-User-facing Windows behaviour, and where Linux stands. X11 was checked on this tree (clicks, the F8 grab, always-on-top). Wayland notes are from the code paths, since a Wayland session is not available here.
+User-facing Windows behaviour, and where Linux stands. X11 was checked on this tree (clicks, the F8 grab, always-on-top). Wayland notes are from the code paths: there is no Wayland session here, and the hotkey listener is unit-tested rather than run against `/dev/input`.
 
 | Feature | Windows | Linux X11 | Linux Wayland | Files |
 | --- | --- | --- | --- | --- |
@@ -14,8 +14,8 @@ User-facing Windows behaviour, and where Linux stands. X11 was checked on this t
 | Jitter (box, ellipse, spread) | working | working | partial — needs a pointer move, same limit as a fixed point | `src/engine.rs` |
 | Click limit and time limit | working | working | working | `src/engine.rs` |
 | Stop when the pointer moves | working | working | partial — with no pointer position the limit never trips | `src/engine.rs` |
-| Global hotkeys | working | working | missing — no global grab; the buttons are the fallback | `src/hotkeys.rs`, `src/ui.rs` |
-| Rebind a hotkey | working | working | partial — the window can capture a chord, but it is not registered globally | `src/ui.rs`, `src/hotkeys.rs` |
+| Global hotkeys | working | working | partial — evdev when `/dev/input/event*` is readable; the key is not swallowed, because Wayland has no per-key grab | `src/evdev_keys.rs`, `src/hotkeys.rs` |
+| Rebind a hotkey | working | working | partial — the window captures the chord; it is armed on the evdev listener when that listener could open a keyboard | `src/ui.rs`, `src/hotkeys.rs`, `src/evdev_keys.rs` |
 | Dark and light theme | working | working | working | `src/ui.rs` |
 | Always on top | working | working | missing — core Wayland has no client stacking request, and winit's `set_window_level` is a no-op. Layer-shell would cover wlroots only, and it is not a normal window | `src/ui.rs` |
 | Window icon | working | working | missing — `set_window_icon` is a no-op. The launcher still uses `featherclick.desktop` | `src/icon.rs`, `assets/` |
