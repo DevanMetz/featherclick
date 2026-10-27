@@ -167,39 +167,17 @@ impl App {
 
     /// Reads the next key combination pressed while the window has focus.
     fn capture_key(&mut self, ctx: &egui::Context) {
-        let mut chosen: Option<Option<String>> = None;
+        let mut chosen = hotkeys::CaptureResult::Ignore;
         ctx.input(|input| {
-            for event in &input.events {
-                let egui::Event::Key {
-                    key,
-                    pressed: true,
-                    repeat: false,
-                    modifiers,
-                    ..
-                } = event
-                else {
-                    continue;
-                };
-                if *key == egui::Key::Escape {
-                    chosen = Some(None);
-                    return;
-                }
-                let Some(code) = key_to_code(*key) else {
-                    continue;
-                };
-                let binding = hotkeys::binding(
-                    code,
-                    modifiers.ctrl,
-                    modifiers.shift,
-                    modifiers.alt,
-                    modifiers.mac_cmd,
-                );
-                chosen = Some(Some(binding.to_string()));
-                return;
-            }
+            let events: Vec<hotkeys::RawEvent> =
+                input.events.iter().filter_map(raw_event).collect();
+            let start = hotkeys::sides_at_frame_start(end_sides(input), &events);
+            chosen = hotkeys::replay_capture(start, &events);
         });
-        if let Some(binding) = chosen {
-            self.end_capture(binding);
+        match chosen {
+            hotkeys::CaptureResult::Cancel => self.end_capture(None),
+            hotkeys::CaptureResult::Binding(binding) => self.end_capture(Some(binding)),
+            hotkeys::CaptureResult::Ignore => {}
         }
     }
 
@@ -775,6 +753,74 @@ fn spawn_notifier(ctx: egui::Context, worker: Worker, shared: Arc<Mutex<Settings
             }
         });
     let _ = spawned;
+}
+
+/// Modifier sides at the end of the frame. Super comes from the key itself:
+/// off macOS, `modifiers.mac_cmd` stays false while the Windows or Super key
+/// is held, and a binding that dropped it would grab the bare key.
+fn end_sides(input: &egui::InputState) -> hotkeys::Sides {
+    let super_l = input.key_down(egui::Key::SuperLeft);
+    let super_r = input.key_down(egui::Key::SuperRight);
+    hotkeys::Sides {
+        ctrl_l: input.key_down(egui::Key::ControlLeft),
+        ctrl_r: input.key_down(egui::Key::ControlRight),
+        shift_l: input.key_down(egui::Key::ShiftLeft),
+        shift_r: input.key_down(egui::Key::ShiftRight),
+        alt_l: input.key_down(egui::Key::AltLeft),
+        alt_r: input.key_down(egui::Key::AltRight),
+        super_l: super_l || (input.modifiers.mac_cmd && !super_l && !super_r),
+        super_r,
+    }
+}
+
+fn side_of(key: egui::Key) -> Option<hotkeys::Side> {
+    Some(match key {
+        egui::Key::ControlLeft => hotkeys::Side::CtrlL,
+        egui::Key::ControlRight => hotkeys::Side::CtrlR,
+        egui::Key::ShiftLeft => hotkeys::Side::ShiftL,
+        egui::Key::ShiftRight => hotkeys::Side::ShiftR,
+        egui::Key::AltLeft => hotkeys::Side::AltL,
+        egui::Key::AltRight => hotkeys::Side::AltR,
+        egui::Key::SuperLeft => hotkeys::Side::SuperL,
+        egui::Key::SuperRight => hotkeys::Side::SuperR,
+        _ => return None,
+    })
+}
+
+fn raw_event(event: &egui::Event) -> Option<hotkeys::RawEvent> {
+    match event {
+        egui::Event::Key {
+            key,
+            pressed,
+            repeat,
+            modifiers,
+            ..
+        } => {
+            if let Some(side) = side_of(*key) {
+                return Some(hotkeys::RawEvent::Side {
+                    side,
+                    pressed: *pressed,
+                    repeat: *repeat,
+                });
+            }
+            Some(hotkeys::RawEvent::Key {
+                code: key_to_code(*key),
+                escape: *key == egui::Key::Escape,
+                pressed: *pressed,
+                repeat: *repeat,
+                mods: hotkeys::HeldMods {
+                    ctrl: modifiers.ctrl,
+                    shift: modifiers.shift,
+                    alt: modifiers.alt,
+                    super_key: modifiers.mac_cmd,
+                },
+            })
+        }
+        egui::Event::Copy => Some(hotkeys::RawEvent::Clipboard(hotkeys::Clipboard::Copy)),
+        egui::Event::Cut => Some(hotkeys::RawEvent::Clipboard(hotkeys::Clipboard::Cut)),
+        egui::Event::Paste(_) => Some(hotkeys::RawEvent::Clipboard(hotkeys::Clipboard::Paste)),
+        _ => None,
+    }
 }
 
 /// Maps an egui key to a physical key code for the global hotkey backends.

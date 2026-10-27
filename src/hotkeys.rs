@@ -201,6 +201,202 @@ pub fn modifiers(ctrl: bool, shift: bool, alt: bool, sup: bool) -> Option<Modifi
     (!mods.is_empty()).then_some(mods)
 }
 
+/// Modifiers held when a capture event arrived.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HeldMods {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub super_key: bool,
+}
+
+impl HeldMods {
+    fn any(self) -> bool {
+        self.ctrl || self.shift || self.alt || self.super_key
+    }
+
+    fn binding(self, code: Code) -> String {
+        binding(code, self.ctrl, self.shift, self.alt, self.super_key).to_string()
+    }
+}
+
+/// One physical side of a modifier key. The two sides are tracked apart so
+/// releasing one does not look like both are up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    CtrlL,
+    CtrlR,
+    ShiftL,
+    ShiftR,
+    AltL,
+    AltR,
+    SuperL,
+    SuperR,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sides {
+    pub ctrl_l: bool,
+    pub ctrl_r: bool,
+    pub shift_l: bool,
+    pub shift_r: bool,
+    pub alt_l: bool,
+    pub alt_r: bool,
+    pub super_l: bool,
+    pub super_r: bool,
+}
+
+impl Sides {
+    fn set(&mut self, side: Side, down: bool) {
+        match side {
+            Side::CtrlL => self.ctrl_l = down,
+            Side::CtrlR => self.ctrl_r = down,
+            Side::ShiftL => self.shift_l = down,
+            Side::ShiftR => self.shift_r = down,
+            Side::AltL => self.alt_l = down,
+            Side::AltR => self.alt_r = down,
+            Side::SuperL => self.super_l = down,
+            Side::SuperR => self.super_r = down,
+        }
+    }
+
+    fn held_mods(self) -> HeldMods {
+        HeldMods {
+            ctrl: self.ctrl_l || self.ctrl_r,
+            shift: self.shift_l || self.shift_r,
+            alt: self.alt_l || self.alt_r,
+            super_key: self.super_l || self.super_r,
+        }
+    }
+}
+
+/// What the capture UI should do with one decided press.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureResult {
+    /// Bare Escape: keep the previous binding.
+    Cancel,
+    /// Store this canonical hotkey string.
+    Binding(String),
+    /// Modifier-only, auto-repeat, or a key the backends cannot bind.
+    Ignore,
+}
+
+/// Clipboard shortcuts egui delivers instead of the key that produced them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clipboard {
+    Copy,
+    Cut,
+    Paste,
+}
+
+/// One input event, reduced to what capture needs. The UI translates egui.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawEvent {
+    /// A modifier side went down or up.
+    Side {
+        side: Side,
+        pressed: bool,
+        repeat: bool,
+    },
+    /// A non-modifier key. `mods` is that event's own modifier snapshot.
+    /// Super is not in it on Windows or Linux, so replay fills it in.
+    Key {
+        code: Option<Code>,
+        escape: bool,
+        pressed: bool,
+        repeat: bool,
+        mods: HeldMods,
+    },
+    Clipboard(Clipboard),
+}
+
+/// State of the modifier sides before `events` were applied.
+pub fn sides_at_frame_start(end: Sides, events: &[RawEvent]) -> Sides {
+    let mut sides = end;
+    for event in events.iter().rev() {
+        if let RawEvent::Side {
+            side,
+            pressed,
+            repeat: false,
+        } = *event
+        {
+            sides.set(side, !pressed);
+        }
+    }
+    sides
+}
+
+/// Walks one frame and returns the first capture decision.
+///
+/// Super is taken from the side tracker, because a Win/Super hold is not
+/// recorded on the key event off macOS — storing the bare key would grab it
+/// globally. Clipboard events are the same press as Ctrl/Cmd+C, X, or V;
+/// egui never sends that key, and the Ctrl key may already be up again by
+/// the end of the frame, so the decision uses the sides at the event.
+pub fn replay_capture(mut sides: Sides, events: &[RawEvent]) -> CaptureResult {
+    for event in events {
+        match *event {
+            RawEvent::Side {
+                side,
+                pressed,
+                repeat,
+            } => {
+                if !repeat {
+                    sides.set(side, pressed);
+                }
+            }
+            RawEvent::Key {
+                code,
+                escape,
+                pressed,
+                repeat,
+                mods,
+            } => {
+                if !pressed || repeat {
+                    continue;
+                }
+                let mut mods = mods;
+                mods.super_key = mods.super_key || sides.held_mods().super_key;
+                let decision = decide_key(code, escape, mods);
+                if !matches!(decision, CaptureResult::Ignore) {
+                    return decision;
+                }
+            }
+            RawEvent::Clipboard(which) => {
+                let decision = decide_clipboard(which, sides.held_mods());
+                if !matches!(decision, CaptureResult::Ignore) {
+                    return decision;
+                }
+            }
+        }
+    }
+    CaptureResult::Ignore
+}
+
+pub fn decide_key(code: Option<Code>, escape: bool, mods: HeldMods) -> CaptureResult {
+    if escape && !mods.any() {
+        return CaptureResult::Cancel;
+    }
+    let Some(code) = code else {
+        return CaptureResult::Ignore;
+    };
+    CaptureResult::Binding(mods.binding(code))
+}
+
+pub fn decide_clipboard(which: Clipboard, mods: HeldMods) -> CaptureResult {
+    // A dedicated Copy key arrives with no Ctrl or Super. Binding it as C
+    // would grab the letter. Those keys are not something the backends spell.
+    if !mods.ctrl && !mods.super_key {
+        return CaptureResult::Ignore;
+    }
+    let code = match which {
+        Clipboard::Copy => Code::KeyC,
+        Clipboard::Cut => Code::KeyX,
+        Clipboard::Paste => Code::KeyV,
+    };
+    CaptureResult::Binding(mods.binding(code))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +551,159 @@ mod tests {
         assert!(gate.accept(5, true, start));
         assert!(!gate.accept(5, false, start + Duration::from_millis(50)));
         assert!(gate.accept(5, true, start + Duration::from_millis(600)));
+    }
+
+    fn mods_of(text: &str) -> (Modifiers, Code) {
+        let hotkey = parse(text).unwrap_or_else(|| panic!("{text} should parse"));
+        (hotkey.mods, hotkey.key)
+    }
+
+    #[test]
+    fn super_is_part_of_the_binding_even_when_the_key_event_omits_it() {
+        // Win/Super is down before the letter, and the letter's own snapshot
+        // does not mention it. That is what Windows and Linux report.
+        let end = Sides {
+            super_l: true,
+            ..Sides::default()
+        };
+        let events = [
+            RawEvent::Side {
+                side: Side::SuperL,
+                pressed: true,
+                repeat: false,
+            },
+            RawEvent::Key {
+                code: Some(Code::KeyK),
+                escape: false,
+                pressed: true,
+                repeat: false,
+                mods: HeldMods::default(),
+            },
+        ];
+        let decision = replay_capture(sides_at_frame_start(end, &events), &events);
+        let CaptureResult::Binding(text) = decision else {
+            panic!("expected a binding, got {decision:?}");
+        };
+        assert_eq!(pretty(&text), "Super+K");
+        let (mods, key) = mods_of(&text);
+        assert_eq!(key, Code::KeyK);
+        assert!(mods.contains(Modifiers::SUPER));
+        assert!(!mods.contains(Modifiers::CONTROL));
+    }
+
+    #[test]
+    fn a_key_pressed_before_super_does_not_pick_the_modifier_up() {
+        let end = Sides {
+            super_l: true,
+            ..Sides::default()
+        };
+        let events = [
+            RawEvent::Key {
+                code: Some(Code::KeyK),
+                escape: false,
+                pressed: true,
+                repeat: false,
+                mods: HeldMods::default(),
+            },
+            RawEvent::Side {
+                side: Side::SuperL,
+                pressed: true,
+                repeat: false,
+            },
+        ];
+        let decision = replay_capture(sides_at_frame_start(end, &events), &events);
+        let CaptureResult::Binding(text) = decision else {
+            panic!("expected a binding, got {decision:?}");
+        };
+        let (mods, key) = mods_of(&text);
+        assert_eq!(key, Code::KeyK);
+        assert!(mods.is_empty(), "super went down after the letter: {text}");
+    }
+
+    #[test]
+    fn ctrl_c_is_captured_from_the_clipboard_event_even_if_ctrl_is_already_up() {
+        // A quick tap can press Ctrl, deliver Copy, and release Ctrl in one frame.
+        let end = Sides::default();
+        let events = [
+            RawEvent::Side {
+                side: Side::CtrlL,
+                pressed: true,
+                repeat: false,
+            },
+            RawEvent::Clipboard(Clipboard::Copy),
+            RawEvent::Side {
+                side: Side::CtrlL,
+                pressed: false,
+                repeat: false,
+            },
+        ];
+        let decision = replay_capture(sides_at_frame_start(end, &events), &events);
+        let CaptureResult::Binding(text) = decision else {
+            panic!("expected a binding, got {decision:?}");
+        };
+        assert_eq!(pretty(&text), "Ctrl+C");
+        let (mods, key) = mods_of(&text);
+        assert_eq!(key, Code::KeyC);
+        assert!(mods.contains(Modifiers::CONTROL));
+    }
+
+    #[test]
+    fn shift_stays_on_a_clipboard_chord_and_a_bare_copy_key_is_not_the_letter_c() {
+        let end = Sides {
+            ctrl_l: true,
+            shift_l: true,
+            ..Sides::default()
+        };
+        let decision = replay_capture(end, &[RawEvent::Clipboard(Clipboard::Cut)]);
+        let CaptureResult::Binding(text) = decision else {
+            panic!("expected a binding, got {decision:?}");
+        };
+        assert_eq!(pretty(&text), "Shift+Ctrl+X");
+        let (mods, key) = mods_of(&text);
+        assert_eq!(key, Code::KeyX);
+        assert!(mods.contains(Modifiers::SHIFT));
+        assert!(mods.contains(Modifiers::CONTROL));
+
+        assert_eq!(
+            decide_clipboard(Clipboard::Copy, HeldMods::default()),
+            CaptureResult::Ignore,
+            "a modifier-less Copy event must not grab the letter C"
+        );
+        assert_eq!(
+            decide_clipboard(
+                Clipboard::Paste,
+                HeldMods {
+                    super_key: true,
+                    ..HeldMods::default()
+                }
+            ),
+            CaptureResult::Binding(binding(Code::KeyV, false, false, false, true).to_string())
+        );
+    }
+
+    #[test]
+    fn bare_escape_cancels_and_a_modified_escape_is_a_binding() {
+        assert_eq!(
+            decide_key(Some(Code::Escape), true, HeldMods::default()),
+            CaptureResult::Cancel
+        );
+        let decision = decide_key(
+            Some(Code::Escape),
+            true,
+            HeldMods {
+                ctrl: true,
+                ..HeldMods::default()
+            },
+        );
+        let CaptureResult::Binding(text) = decision else {
+            panic!("expected a binding, got {decision:?}");
+        };
+        let (mods, key) = mods_of(&text);
+        assert_eq!(key, Code::Escape);
+        assert!(mods.contains(Modifiers::CONTROL));
+        assert_eq!(
+            decide_key(None, false, HeldMods::default()),
+            CaptureResult::Ignore
+        );
     }
 }
