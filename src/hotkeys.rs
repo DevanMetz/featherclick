@@ -2,8 +2,8 @@
 //!
 //! Windows, macOS, and X11 grabs must be created on the thread that owns the
 //! platform event loop, so `Hotkeys` is built in `App::new`. A Wayland session
-//! reads the keyboard device instead. Both publish on one channel, which the
-//! notifier thread reads.
+//! prefers the GlobalShortcuts portal, then reads keyboard devices. All backends
+//! publish on one channel, which the notifier thread reads.
 
 use std::str::FromStr;
 use std::sync::mpsc::{Receiver, RecvError, Sender, channel};
@@ -17,6 +17,10 @@ use global_hotkey::{GlobalHotKeyManager, HotKeyState};
 #[cfg(target_os = "linux")]
 #[path = "evdev_keys.rs"]
 mod evdev_keys;
+
+#[cfg(target_os = "linux")]
+#[path = "portal_hotkeys.rs"]
+mod portal_hotkeys;
 
 /// A press or release of a registered chord, from whichever backend is in use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +104,17 @@ enum Backend {
     /// windows, even when XWayland has set `DISPLAY`.
     #[cfg(target_os = "linux")]
     Devices(evdev_keys::Listener),
+    #[cfg(target_os = "linux")]
+    Portal(portal_hotkeys::Listener),
+}
+
+// XWayland grabs cannot see native Wayland windows. Only X11 sessions use grabs.
+#[cfg(target_os = "linux")]
+fn wayland_backend<T>(
+    portal: impl FnOnce() -> Result<T, String>,
+    devices: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    portal().or_else(|_| devices())
 }
 
 pub struct Hotkeys {
@@ -115,11 +130,12 @@ impl Hotkeys {
             std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
             std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
         ) {
-            // Do not fall back to the X11 grab: it registers successfully and
-            // then never fires, which looks like a working hotkey.
-            let listener = evdev_keys::Listener::start(publish)?;
+            let backend = wayland_backend(
+                || portal_hotkeys::Listener::open().map(Backend::Portal),
+                || evdev_keys::Listener::start(publish).map(Backend::Devices),
+            )?;
             return Ok(Self {
-                backend: Backend::Devices(listener),
+                backend,
                 toggle: None,
                 capture: None,
             });
@@ -140,6 +156,27 @@ impl Hotkeys {
     /// registered, which in practice means another application owns it.
     pub fn apply(&mut self, toggle: Option<HotKey>, capture: Option<HotKey>) -> Option<String> {
         let (toggle, capture, shared) = separate_duplicate(toggle, capture);
+        #[cfg(target_os = "linux")]
+        if let Backend::Portal(listener) = &mut self.backend {
+            if self.toggle == toggle && self.capture == capture {
+                return shared;
+            }
+            match listener.set(toggle, capture) {
+                Ok(()) => {
+                    self.toggle = toggle;
+                    self.capture = capture;
+                    return shared;
+                }
+                Err(portal_error) => match evdev_keys::Listener::start(publish) {
+                    Ok(listener) => self.backend = Backend::Devices(listener),
+                    Err(device_error) => {
+                        self.toggle = None;
+                        self.capture = None;
+                        return Some(format!("{portal_error}; {device_error}"));
+                    }
+                },
+            }
+        }
         let mut problem = match &mut self.backend {
             Backend::Grab(manager) => {
                 for hotkey in [self.toggle, self.capture].into_iter().flatten() {
@@ -165,6 +202,8 @@ impl Hotkeys {
             }
             #[cfg(target_os = "linux")]
             Backend::Devices(listener) => listener.set(toggle, capture),
+            #[cfg(target_os = "linux")]
+            Backend::Portal(_) => unreachable!("portal handled above"),
         };
         if problem.is_none() {
             problem = shared;
@@ -943,6 +982,29 @@ mod tests {
         assert_eq!(
             decide_key(None, false, HeldMods::default()),
             CaptureResult::Ignore
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod backend_tests {
+    use super::*;
+    #[test]
+    fn portal_is_preferred_and_devices_are_only_a_fallback() {
+        assert_eq!(
+            wayland_backend(|| Ok("portal"), || panic!("must not open devices")),
+            Ok("portal")
+        );
+        assert_eq!(
+            wayland_backend(|| Err("refused".into()), || Ok("devices")),
+            Ok("devices")
+        );
+        assert_eq!(
+            wayland_backend::<()>(
+                || Err("missing".into()),
+                || Err("no keyboard access".into())
+            ),
+            Err("no keyboard access".into())
         );
     }
 }

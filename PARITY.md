@@ -22,8 +22,8 @@ equivalent is named in the note.
 | Click limit | working | working | working | `src/engine.rs` |
 | Time limit | working | working | working | `src/engine.rs` |
 | Stop when the pointer moves | working | working | partial | `src/engine.rs` |
-| Global hotkeys (toggle and pick) | working | working | partial — readable `/dev/input/event*` required; keys are not swallowed | `src/hotkeys.rs`, `src/evdev_keys.rs` |
-| Rebind a hotkey | working | working | partial — requires keyboard access | `src/ui.rs`, `src/hotkeys.rs`, `src/evdev_keys.rs` |
+| Global hotkeys (toggle and pick) | working | working | working with GlobalShortcuts portal; evdev fallback requires readable `/dev/input/event*` and does not swallow keys | `src/hotkeys.rs`, `src/portal_hotkeys.rs`, `src/evdev_keys.rs` |
+| Rebind a hotkey | working | working | working with GlobalShortcuts portal; evdev fallback requires keyboard access | `src/ui.rs`, `src/hotkeys.rs`, `src/portal_hotkeys.rs`, `src/evdev_keys.rs` |
 | Dark / light theme | working | working | working | `src/ui.rs` |
 | Always on top | working | working | not possible | `src/ui.rs` |
 | Window icon | working | working | partial | `src/icon.rs`, `src/main.rs`, `src/wayland_icon.rs`, `assets/featherclick.desktop` |
@@ -54,10 +54,19 @@ The stop-on-move check itself runs after each click on every platform.
 
 ## Hotkeys
 
-`global-hotkey` on X11 uses a grab. On Wayland the listener reads keyboard
-devices without grabbing them, so the focused window also receives the key.
-Access to `/dev/input/event*` is required, typically via the `input` group.
-The on-screen buttons still work without access.
+`global-hotkey` on X11 uses a grab. Wayland prefers the
+[GlobalShortcuts portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html)
+for toggle and pick, without `/dev/input` access. The desktop controls approval,
+key consumption and the final shortcuts; configured keys are preferred triggers
+and the desktop may override them. Rebinding closes the old session and registers
+the new triggers in a fresh session, which may show another approval dialog.
+
+When the portal is missing, refuses registration, or does not bind both requested
+actions, FeatherClick falls back to the existing keyboard device listener.
+That fallback requires readable `/dev/input/event*` (typically via the `input`
+group) and the focused window also receives the key. XWayland grabs cannot see
+native Wayland windows, so grabs are used only in X11 sessions. The on-screen
+buttons still work when neither Wayland backend is available.
 
 ## Always on top
 
