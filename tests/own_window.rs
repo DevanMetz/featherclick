@@ -34,7 +34,7 @@ struct PrivateDisplay {
 
 impl PrivateDisplay {
     fn start() -> Option<Self> {
-        for _ in 0..20 {
+        for _ in 0..10_000 {
             let number = NEXT_DISPLAY.fetch_add(1, Ordering::Relaxed);
             let name = format!(":{number}");
             let socket = format!("/tmp/.X11-unix/X{number}");
@@ -77,7 +77,9 @@ impl PrivateDisplay {
 
 impl Drop for PrivateDisplay {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        // Let Xvfb remove its socket and lock before reaping it.
+        // SAFETY: the child is still owned here and its PID identifies Xvfb.
+        unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) };
         let _ = self.child.wait();
     }
 }
