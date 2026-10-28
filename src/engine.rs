@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(any(not(windows), test))]
 use enigo::Coordinate;
-use enigo::{Button, Direction, Enigo, InputResult, Mouse, Settings as EnigoSettings};
+#[cfg(target_os = "linux")]
+use enigo::Settings as EnigoSettings;
+use enigo::{Button, Direction, Enigo, InputResult, Mouse};
 
 use crate::config::{ClickStyle, JitterMode, MouseButton, PositionMode, Settings, TimingMode};
 
@@ -236,12 +238,14 @@ fn snapshot(settings: &Settings) -> Settings {
 /// Display name that is not a parseable X11 display and not a Wayland socket.
 /// Passing it forces that one backend to fail immediately, so the other is
 /// the only connection enigo keeps.
+#[cfg(any(target_os = "linux", test))]
 const ISOLATED_DISPLAY: &str = "featherclick-no-display";
 
 /// One attempt to open an input connection.
 ///
 /// `None` leaves that server to the environment. `Some` forces the name enigo
 /// will try, which is how a backend is kept out of the connection.
+#[cfg(any(target_os = "linux", test))]
 struct BackendAttempt {
     wayland_display: Option<String>,
     x11_display: Option<String>,
@@ -270,6 +274,9 @@ fn backend_attempts(wayland_is_set: bool) -> Vec<BackendAttempt> {
     attempts
 }
 
+/// Only the Linux X11 pointer fallback opens a connection with forced
+/// display names; other platforms connect through `crate::input`.
+#[cfg(target_os = "linux")]
 fn enigo_settings(attempt: &BackendAttempt) -> EnigoSettings {
     EnigoSettings {
         // Every extra millisecond of per-event delay is a millisecond off the

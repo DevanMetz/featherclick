@@ -124,7 +124,7 @@ fn xdotool(display: &str, args: &[&str]) -> std::process::Output {
         .unwrap_or_else(|err| panic!("xdotool {args:?} failed to start: {err}"))
 }
 
-fn search_window(display: &str) -> String {
+fn search_window(display: &str, gui: &Gui) -> String {
     let output = Command::new("timeout")
         .args([
             "15",
@@ -143,7 +143,8 @@ fn search_window(display: &str) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "FeatherClick window did not appear\n{stdout}{stderr}"
+        "FeatherClick window did not appear\n{stdout}{stderr}\n{}",
+        gui.output()
     );
     let mut best_area = i64::MIN;
     let mut best_id = None;
@@ -494,7 +495,7 @@ fn pointer_mode_waits_on_the_window_then_clicks_where_the_pointer_moves() {
     compile_catcher(&scratch.catcher_bin);
 
     let mut gui = Gui::spawn(&display.name, &scratch.home);
-    let id = search_window(&display.name);
+    let id = search_window(&display.name, &gui);
     assert!(
         gui.alive(),
         "featherclick exited before the test\n{}",
@@ -586,7 +587,7 @@ fn fixed_point_away_from_the_window_still_receives_clicks() {
     compile_catcher(&scratch.catcher_bin);
 
     let gui = Gui::spawn(&display.name, &scratch.home);
-    let id = search_window(&display.name);
+    let id = search_window(&display.name, &gui);
     window_move(&display.name, &id, 40, 40);
     thread::sleep(Duration::from_millis(200));
     let window = geometry(&display.name, &id);
