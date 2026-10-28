@@ -767,6 +767,7 @@ dependencies = [
  "eframe",
  "enigo",
  "global-hotkey",
+ "libc",
  "rand",
  "serde",
  "serde_json",

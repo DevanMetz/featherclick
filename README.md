@@ -132,9 +132,9 @@ settings. Passing `--clicks` or `--seconds` replaces both saved limits, so
 `--seconds 30` runs for 30 seconds even if the config also has a click cap, and
 `--clicks 20` is not cut short by a saved time limit.
 
-Exit status is `0` for a normal stop — including limits — `1` if the input
-backend could not be reached or failed during a run, and `2` for invalid
-arguments.
+Exit status is `0` for a normal stop — including limits and Ctrl+C — `1` if the
+input backend could not be reached or failed during a run, and `2` for invalid
+arguments. A second Ctrl+C exits immediately.
 
 Coordinates are physical screen pixels, measured from the top-left of the
 primary display.
@@ -202,11 +202,12 @@ requested rate: asking for 1 ms measured 193 clicks/s. At that rate the loop
 used 3.1% of one core, and at 10 clicks/s the processor time was too small to
 measure at all.
 
-**Precision features are not decoration.** `stop-on-move`, the click counter and
-the elapsed timer are all sampled on the same loop as the clicks. The click cap
-is checked as soon as the final click is sent, and a time limit or pending stop
-interrupts a long interval rather than waiting it out, so a stop is noticed
-within one 25 ms sleep slice.
+**Precision features are not decoration.** The click cap is checked as soon as
+the final click is sent. A time limit, a pending stop, headless Ctrl+C and
+stop-on-move are sampled every 25 ms sleep slice, so each is noticed within
+one slice instead of at the next click. Stop-on-move watches the point the
+pointer was left at, so moving onto a fixed target is not the user taking the
+mouse. A hold releases the button when that stop arrives.
 
 **Lightness.** One process, one worker thread, an egui window that repaints only
 while a run is active or a countdown is on screen: 10 seconds of idle time
