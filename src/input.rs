@@ -53,6 +53,62 @@ pub fn connect() -> Result<Input, String> {
     enigo()
 }
 
+/// Headless runs need no window handle: the portal accepts an empty parent
+/// and reuses the same private restore token as GUI runs.
+pub(crate) fn connect_headless() -> Result<Input, String> {
+    #[cfg(target_os = "linux")]
+    {
+        connect_headless_with(
+            crate::wayland_probe::wayland_session(),
+            |backend| match backend {
+                HeadlessBackend::VirtualPointer => WaylandPointer::connect().map(|pointer| Input {
+                    inner: Inner::Wayland(Box::new(pointer)),
+                }),
+                HeadlessBackend::Portal => {
+                    crate::portal::PortalPointer::open().map(|pointer| Input {
+                        inner: Inner::Portal(Box::new(pointer)),
+                    })
+                }
+                HeadlessBackend::X11 => enigo(),
+            },
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    connect()
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadlessBackend {
+    VirtualPointer,
+    Portal,
+    X11,
+}
+
+#[cfg(target_os = "linux")]
+fn connect_headless_with<T>(
+    wayland: bool,
+    mut open: impl FnMut(HeadlessBackend) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut errors = Vec::new();
+    let backends: &[HeadlessBackend] = if wayland {
+        &[
+            HeadlessBackend::VirtualPointer,
+            HeadlessBackend::Portal,
+            HeadlessBackend::X11,
+        ]
+    } else {
+        &[HeadlessBackend::X11]
+    };
+    for &backend in backends {
+        match open(backend) {
+            Ok(input) => return Ok(input),
+            Err(error) => errors.push(error),
+        }
+    }
+    Err(format!("no input backend works: {}", errors.join("; ")))
+}
+
 fn enigo() -> Result<Input, String> {
     let settings = EnigoSettings {
         // Every extra millisecond of per-event delay is a millisecond off the
@@ -170,5 +226,54 @@ impl enigo::Mouse for Input {
     }
     fn location(&self) -> enigo::InputResult<(i32, i32)> {
         Input::location(self).map_err(enigo::InputError::Mapping)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod headless_tests {
+    use super::*;
+
+    #[test]
+    fn wayland_falls_back_in_order_and_stops_at_the_first_connection() {
+        use HeadlessBackend::*;
+        for (winner, expected) in [
+            (VirtualPointer, vec![VirtualPointer]),
+            (Portal, vec![VirtualPointer, Portal]),
+            (X11, vec![VirtualPointer, Portal, X11]),
+        ] {
+            let mut attempts = Vec::new();
+            let result = connect_headless_with(true, |backend| {
+                attempts.push(backend);
+                if backend == winner {
+                    Ok(backend)
+                } else {
+                    Err("unavailable".into())
+                }
+            });
+            assert_eq!(result.unwrap(), winner);
+            assert_eq!(attempts, expected);
+        }
+    }
+
+    #[test]
+    fn x11_never_requests_portal_permission() {
+        let mut attempts = Vec::new();
+        let result = connect_headless_with(false, |backend| {
+            attempts.push(backend);
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(attempts, [HeadlessBackend::X11]);
+    }
+
+    #[test]
+    fn total_failure_preserves_backend_errors() {
+        let error =
+            connect_headless_with::<()>(true, |backend| Err(format!("{backend:?} unavailable")))
+                .unwrap_err();
+        assert!(error.starts_with("no input backend works:"));
+        for name in ["VirtualPointer", "Portal", "X11"] {
+            assert!(error.contains(name));
+        }
     }
 }
