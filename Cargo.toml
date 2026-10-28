@@ -1,6 +1,6 @@
 [package]
 name = "featherclick"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A fast, tiny, cross-platform autoclicker with human-like randomisation"
 license = "MIT"
