@@ -18,12 +18,13 @@ equivalent is named in the note.
 | Click at the pointer | working | working | partial | `src/engine.rs` |
 | Click a fixed point | working | working | working | `src/engine.rs` |
 | Pick the pointer position | working | working | working | `src/engine.rs`, `src/ui.rs`, `src/pick_overlay.rs` |
-| Jitter (off, box, ellipse, spread) | working | working | partial | `src/engine.rs` |
+| Jitter (off, box, ellipse, spread) | working | working — overflow-safe offsets; ellipse stays within its radii | partial — screen bounds remain backend-dependent | `src/engine.rs` |
 | Click limit | working | working | working | `src/engine.rs` |
 | Time limit | working | working | working | `src/engine.rs` |
-| Stop when the pointer moves | working | working | partial | `src/engine.rs` |
+| Stop when the pointer moves | working | working — tracks placed/clipped points during holds and double clicks | partial — requires pointer readings | `src/engine.rs` |
 | Global hotkeys (toggle and pick) | working | working | working with GlobalShortcuts portal; evdev fallback requires readable `/dev/input/event*` and does not swallow keys | `src/hotkeys.rs`, `src/portal_hotkeys.rs`, `src/evdev_keys.rs` |
 | Rebind a hotkey | working | working | working with GlobalShortcuts portal; evdev fallback requires keyboard access | `src/ui.rs`, `src/hotkeys.rs`, `src/portal_hotkeys.rs`, `src/evdev_keys.rs` |
+
 | Dark / light theme | working | working | working | `src/ui.rs` |
 | Always on top | working | working | not possible | `src/ui.rs` |
 | Window icon | working | working | partial | `src/icon.rs`, `src/main.rs`, `src/wayland_icon.rs`, `assets/featherclick.desktop` |
