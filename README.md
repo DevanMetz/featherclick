@@ -11,7 +11,7 @@ Single binary, no runtime dependencies, no background services.
 ## Features
 
 - **Human-like timing** — fixed interval, uniform random between a min and max, or
-  Gaussian (mean and sigma), all in milliseconds.
+  Gaussian (mean and sigma, within ±4 sigma), all in milliseconds.
 - **Random pixels in a range** — every click can land anywhere in a box, an
   ellipse, or a Gaussian spread around the target.
 - **Limits that stop it for you** — stop after *N* clicks, after *S* seconds, or
@@ -59,25 +59,28 @@ install -Dm644 featherclick.desktop ~/.local/share/applications/featherclick.des
 install -Dm644 featherclick.png ~/.local/share/icons/hicolor/256x256/apps/featherclick.png
 ```
 
-GNOME and KDE ask for remote-desktop permission the first time a run starts.
-The grant is kept in `~/.config/featherclick/portal-restore`.
-
 ## Platform support
 
 | | Windows 10/11 | macOS 11+ | Linux (X11) | Linux (Wayland) |
 | --- | --- | --- | --- | --- |
 | Clicking | ✅ | ✅ (Accessibility permission) | ✅ | ✅ wlroots, or the portal on GNOME and KDE |
-| Global hotkeys | ✅ | ✅ | ✅ | ❌ — use the buttons |
-| Picking a position | ✅ | ✅ | ✅ | ✅ |
+| Global hotkeys | ✅ | ✅ | ✅ | ✅ with access to `/dev/input` |
+| Picking a position | ✅ | ✅ | ✅ | ✅ via XWayland |
 
-On Wayland, wlroots compositors (Sway, Hyprland) are clicked through the
-virtual-pointer protocol. GNOME and KDE do not offer it. The first run there
-asks the RemoteDesktop portal for pointer control, stores the grant, and later
-runs reuse it. Clicks use that portal's logical layout, including a monitor
-left of the origin. If the portal is refused or missing, clicks still reach
-XWayland windows; the error is shown only when X11 cannot be used either.
-Wayland has no global grabs, so hotkeys stay unavailable there and the
-on-screen buttons drive the run.
+On GNOME and KDE, clicking uses the RemoteDesktop portal. Permission is requested when a run starts and the grant is saved for later runs. If the portal fails, XWayland is used when available. Portal coordinates use the stream’s logical layout.
+
+On wlroots, clicking uses the compositor's virtual-pointer protocol, which
+wlroots-based compositors (Sway, Hyprland) provide. Fixed points map across
+the entire xdg-output logical layout, including monitors left of or above the
+origin and fractional scaling. On compositors without virtual-pointer support, the portal is used, with XWayland as a fallback. A click is sent to one server. When both Wayland and
+X11 are available, the virtual pointer clicks and X11 is only asked where
+the pointer is, because Wayland has no protocol for that. Pick, cursor
+jitter and stop-on-move need that reading and say so when it is missing.
+Hotkeys are read from `/dev/input/event*` (the `input` group on most
+distributions). Wayland has no per-key grab, so the focused window still
+receives the key. The compositor does not report the window position, so a
+fixed point is not compared with the window; pointer mode waits while the
+pointer is over it.
 
 ## Using the window
 
@@ -86,10 +89,12 @@ on-screen buttons drive the run.
    anything watching for automation; `Human-like` gives a Gaussian spread.
 3. Choose a **Target**:
    - **Pointer** clicks wherever the pointer already is and never moves it, so
-     you can keep repositioning while it runs.
-   - **Fixed** returns to a point before every click. Type coordinates, or press
-     **Pick** and the position is taken after a 3 second countdown, or press the
-     pick hotkey (`F7` by default) while hovering the target.
+     you can keep repositioning while it runs. It waits while the pointer is
+     over the FeatherClick window.
+   - **Fixed** returns to a point before every click, and waits while that point
+     is covered by the window. Type coordinates, or press **Pick** and the
+     position is taken after a 3 second countdown, or press the pick hotkey
+     (`F7` by default) while hovering the target.
 4. Optionally add **Jitter** — the spread around the target, in pixels.
 5. Set **Limits** if you want the run to end by itself.
 6. Press **Start** (or the toggle hotkey).
@@ -125,23 +130,23 @@ featherclick --headless --clicks 100
 | `--at <X,Y>` | Click a fixed screen point. |
 | `--jitter <PX>` | Randomise the point by up to ±PX pixels. |
 | `--button <left\|right\|middle>` | Which button to click. |
-| `--delay <MS>` | Wait before the first click. |
+| `--delay <MS>` | Wait before the first click. The time limit starts afterwards. |
 | `--quiet` | Print only the final summary. |
 | `--help`, `--version` | Usage and version. |
 
 Style, jitter shape, stop-on-move and the other options come from the saved
 settings. Passing `--clicks` or `--seconds` replaces both saved limits, so
 `--seconds 30` runs for 30 seconds even if the config also has a click cap, and
-`--clicks 20` is not cut short by a saved time limit.
+`--clicks 20` is not cut short by a saved time limit. A start delay finishes
+before that time limit starts, so `--delay 2000 --seconds 1` still clicks.
 
-Exit status is `0` for a normal stop — including limits — `1` if the input
-backend could not be reached or failed during a run, and `2` for invalid
-arguments.
+Exit status is `0` for a normal stop — including limits and Ctrl+C — `1` if the
+input backend could not be reached or failed during a run, and `2` for invalid
+arguments. A second Ctrl+C exits immediately.
 
-Coordinates are screen pixels from the top-left of the primary display. On
-X11 and Windows they are physical pixels. A Wayland session that uses the
-remote desktop portal uses logical pixels, and a monitor can sit left of the
-origin.
+Coordinates are physical screen pixels on Windows and X11. On Wayland they
+are points in the compositor’s logical layout. Monitors left of or above the
+origin can have negative coordinates.
 
 ## Configuration
 
@@ -188,7 +193,10 @@ directly:
 
 Missing or unknown fields are ignored, so a partial file still loads. Values are
 clamped into usable ranges on load — for example an inverted min/max pair is
-swapped rather than rejected.
+swapped rather than rejected. A file that does not parse is left untouched.
+The window opens on defaults and reports the error; a headless run exits with
+status 1 instead of clicking with those defaults. The first save after an edit
+copies the old file to `config.json.bak` and then replaces it.
 
 ## How it works
 
@@ -206,11 +214,12 @@ requested rate: asking for 1 ms measured 193 clicks/s. At that rate the loop
 used 3.1% of one core, and at 10 clicks/s the processor time was too small to
 measure at all.
 
-**Precision features are not decoration.** `stop-on-move`, the click counter and
-the elapsed timer are all sampled on the same loop as the clicks. The click cap
-is checked as soon as the final click is sent, and a time limit or pending stop
-interrupts a long interval rather than waiting it out, so a stop is noticed
-within one 25 ms sleep slice.
+**Precision features are not decoration.** The click cap is checked as soon as
+the final click is sent. A time limit, a pending stop, headless Ctrl+C and
+stop-on-move are sampled every 25 ms sleep slice, so each is noticed within
+one slice instead of at the next click. Stop-on-move watches the point the
+pointer was left at, so moving onto a fixed target is not the user taking the
+mouse. A hold releases the button when that stop arrives.
 
 **Lightness.** One process, one worker thread, an egui window that repaints only
 while a run is active or a countdown is on screen: 10 seconds of idle time
@@ -220,9 +229,11 @@ system GUI toolkit, no web view and no scripting engine. Accessibility tree
 support is compiled out to keep the binary small, which means the UI is not
 exposed to screen readers.
 
-**State.** The engine snapshots your settings when a run starts, so a run cannot
-change shape halfway through. The UI writes settings to disk 400 ms after the
-last edit, atomically, so an interrupted save cannot truncate the file.
+**State.** The engine snapshots your settings when a run starts and clamps them
+the same way a load does, so a run cannot change shape halfway through. The
+window writes the file 400 ms after the last edit, and on close if that edit
+is still unsaved. It does not write on launch. The new contents are flushed
+before the file is replaced, so a crash cannot leave it half-written.
 
 ## Building
 
@@ -249,8 +260,10 @@ virtual X display to prove the input backend actually connects.
 
 ## Limitations
 
-- Global hotkeys are implemented with OS-level registration: X11 only on Linux,
-  and the hotkey never reaches the focused application.
+- Global hotkeys use an OS-level grab on Windows, macOS, and X11, so the key
+  does not reach the focused application. On Wayland, FeatherClick reads
+  `/dev/input` instead (the `input` group), and the focused application still
+  receives the key.
 - No macro recording, sequences, or keyboard keys — FeatherClick clicks, and
   nothing else.
 - Windows and macOS builds are unsigned. Windows SmartScreen may warn on first

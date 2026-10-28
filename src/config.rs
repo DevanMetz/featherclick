@@ -1,6 +1,11 @@
 //! User settings and their on-disk representation.
+//!
+//! A file that does not parse is reported and left byte for byte. Callers
+//! decide whether that is fatal. A write goes to a temporary file in the same
+//! directory, is flushed, and only then replaces the destination, so a crash
+//! leaves the previous file in place.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -233,31 +238,106 @@ impl Settings {
     }
 }
 
-pub fn load() -> Settings {
-    let mut settings = std::fs::read_to_string(config_path())
-        .ok()
-        .and_then(|raw| match serde_json::from_str::<Settings>(&raw) {
-            Ok(settings) => Some(settings),
-            Err(err) => {
-                eprintln!("featherclick: ignoring malformed config: {err}");
-                None
-            }
-        })
-        .unwrap_or_default();
-    settings.sanitize();
-    settings
+/// Settings read from disk, plus why they fell back to defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadOutcome {
+    pub settings: Settings,
+    /// Set when a file was present but could not be used. The file is unchanged.
+    pub error: Option<String>,
+}
+
+/// Reads the config file. A missing file is defaults and not an error.
+pub fn load_outcome() -> LoadOutcome {
+    read_at(&config_path())
 }
 
 pub fn save(settings: &Settings) -> std::io::Result<()> {
-    let path = config_path();
+    write_at(&config_path(), settings, false)
+}
+
+/// Like [`save`], but copies an existing file to `config.json.bak` first.
+///
+/// The copy happens before the replacement. If the copy fails, the original
+/// file is left alone.
+pub fn save_with_backup(settings: &Settings) -> std::io::Result<()> {
+    write_at(&config_path(), settings, true)
+}
+
+fn read_at(path: &Path) -> LoadOutcome {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => match serde_json::from_str::<Settings>(&raw) {
+            Ok(mut settings) => {
+                settings.sanitize();
+                LoadOutcome {
+                    settings,
+                    error: None,
+                }
+            }
+            Err(err) => LoadOutcome {
+                settings: Settings::default(),
+                error: Some(format!("cannot parse {}: {err}", path.display())),
+            },
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => LoadOutcome {
+            settings: Settings::default(),
+            error: None,
+        },
+        Err(err) => LoadOutcome {
+            settings: Settings::default(),
+            error: Some(format!("cannot read {}: {err}", path.display())),
+        },
+    }
+}
+
+fn write_at(path: &Path, settings: &Settings, backup: bool) -> std::io::Result<()> {
+    if backup && path.is_file() {
+        std::fs::copy(path, backup_path(path))?;
+    }
+    // Persist the clamped values, so the next launch does not depend on
+    // repairing the same hand edit again. The caller's copy is left as it is.
+    let mut settings = settings.clone();
+    settings.sanitize();
+    let json = serde_json::to_string_pretty(&settings)?;
+    write_atomic(path, json.as_bytes())
+}
+
+/// Sync the temp file before renaming it over `path`. A crash during the write
+/// then keeps the previous file, and the new bytes are already durable once
+/// the name points at them.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(settings)?;
-    // Write-then-rename so a crash mid-write cannot truncate the config.
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &path)
+    let tmp = temp_path(path);
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn backup_path(path: &Path) -> PathBuf {
+    sibling(path, ".bak")
+}
+
+fn temp_path(path: &Path) -> PathBuf {
+    sibling(path, ".tmp")
+}
+
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
 }
 
 #[cfg(test)]
@@ -324,5 +404,137 @@ mod tests {
             low < 10.0 && high > 10.0,
             "{low}..{high} should straddle 10/s"
         );
+    }
+
+    struct Scratch {
+        path: PathBuf,
+    }
+
+    impl Scratch {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("featherclick-config-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn a_missing_file_is_defaults_without_an_error() {
+        let dir = Scratch::new();
+        let outcome = read_at(&dir.path.join("config.json"));
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.settings, Settings::default());
+    }
+
+    #[test]
+    fn loading_clamps_without_rewriting_the_file() {
+        let dir = Scratch::new();
+        let path = dir.path.join("config.json");
+        let raw =
+            r#"{"interval_ms":0,"interval_min_ms":300,"interval_max_ms":50,"future_field":1}"#;
+        std::fs::write(&path, raw).unwrap();
+
+        let outcome = read_at(&path);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.settings.interval_ms, 1);
+        assert_eq!(
+            (
+                outcome.settings.interval_min_ms,
+                outcome.settings.interval_max_ms
+            ),
+            (50, 300)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), raw.as_bytes());
+    }
+
+    #[test]
+    fn a_file_that_does_not_parse_is_left_byte_for_byte() {
+        let dir = Scratch::new();
+        let path = dir.path.join("config.json");
+        let raw = b"{not json\n";
+        std::fs::write(&path, raw).unwrap();
+
+        let outcome = read_at(&path);
+        let error = outcome.error.expect("parse failure");
+        assert!(error.contains("cannot parse"), "{error}");
+        assert!(error.contains("config.json"), "{error}");
+        assert_eq!(outcome.settings, Settings::default());
+        assert_eq!(std::fs::read(&path).unwrap(), raw);
+    }
+
+    #[test]
+    fn save_replaces_the_file_and_clamps_what_it_writes() {
+        let dir = Scratch::new();
+        let path = dir.path.join("nested").join("config.json");
+        let settings = Settings {
+            interval_ms: 0,
+            point: (12, -4),
+            button: MouseButton::Middle,
+            ..Settings::default()
+        };
+
+        write_at(&path, &settings, false).unwrap();
+
+        assert!(!temp_path(&path).exists(), "temp file left behind");
+        assert!(!backup_path(&path).exists());
+        let outcome = read_at(&path);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.settings.interval_ms, 1);
+        assert_eq!(outcome.settings.point, (12, -4));
+        assert_eq!(outcome.settings.button, MouseButton::Middle);
+        // The caller's struct is not rewritten just because the file was.
+        assert_eq!(settings.interval_ms, 0);
+    }
+
+    #[test]
+    fn the_first_replacement_keeps_the_previous_bytes() {
+        let dir = Scratch::new();
+        let path = dir.path.join("config.json");
+        let raw = b"{not json\n";
+        std::fs::write(&path, raw).unwrap();
+
+        write_at(&path, &Settings::default(), true).unwrap();
+
+        assert_eq!(std::fs::read(backup_path(&path)).unwrap(), raw);
+        assert!(read_at(&path).error.is_none());
+        assert!(!temp_path(&path).exists());
+    }
+
+    #[test]
+    fn a_failed_backup_does_not_replace_the_original() {
+        let dir = Scratch::new();
+        let path = dir.path.join("config.json");
+        let raw = b"{not json\n";
+        std::fs::write(&path, raw).unwrap();
+        // `copy` refuses a directory destination, on every platform.
+        std::fs::create_dir(backup_path(&path)).unwrap();
+
+        let err = write_at(&path, &Settings::default(), true).unwrap_err();
+        assert_eq!(std::fs::read(&path).unwrap(), raw, "{err}");
+        assert!(!temp_path(&path).exists());
+    }
+
+    #[test]
+    fn a_failed_write_keeps_both_the_original_and_its_backup() {
+        let dir = Scratch::new();
+        let path = dir.path.join("config.json");
+        let raw = b"{not json\n";
+        std::fs::write(&path, raw).unwrap();
+        std::fs::create_dir(temp_path(&path)).unwrap();
+
+        let err = write_at(&path, &Settings::default(), true).unwrap_err();
+        assert_eq!(std::fs::read(&path).unwrap(), raw, "{err}");
+        assert_eq!(std::fs::read(backup_path(&path)).unwrap(), raw);
     }
 }

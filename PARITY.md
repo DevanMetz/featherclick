@@ -1,29 +1,93 @@
 # Linux parity
 
-User-facing Windows behaviour, and where Linux stands on this branch. X11 clicks were checked on a virtual display. The portal client was checked against a local bus and a stand-in for `org.freedesktop.portal.RemoteDesktop`. This tree has no Wayland compositor, so the wlroots path is the existing enigo client.
+Windows is the reference. Each row is a user-facing feature or setting, and
+the Linux columns are for the code on this branch. X11 and Wayland are split
+where they differ.
 
-| Feature | Windows | Linux X11 | Linux Wayland | Files |
+`working` means the feature behaves as it does on Windows. `partial` means
+some sessions or inputs work. `missing` means the control does nothing useful.
+`not possible` means a client cannot provide the Windows behavior; the closest
+equivalent is named in the note.
+
+| Feature | Windows | X11 | Wayland | Files |
 | --- | --- | --- | --- | --- |
-| Left, right, and middle click | working | working | partial — wlroots uses the virtual pointer through enigo. GNOME and KDE, which do not offer that protocol, are clicked through the RemoteDesktop portal: one permission dialog, then the grant in `portal-restore`. A refused or missing portal falls back to XWayland windows. If both fail, the portal error is shown | src/engine.rs, src/portal.rs, src/wayland_probe.rs |
-| Single, double, and hold | working | working | partial — same path as clicking | src/engine.rs, src/portal.rs |
-| Fixed, random, and human-like intervals | working | working | working — nanosleep is already fine-grained; there is no `timeBeginPeriod` equivalent to set | src/engine.rs, src/platform.rs |
-| Start delay | working | working | working | src/engine.rs, src/ui.rs |
-| Click at the pointer | working | working | partial — a portal click with no move lands on the seat cursor. The position is read from XWayland when `DISPLAY` is set. A pure Wayland session cannot report the pointer | src/engine.rs, src/portal.rs |
-| Click a fixed point | working | working | partial — the portal aims at the stream that contains the point, in logical pixels, including a monitor left of the origin. wlroots still uses enigo's first output and rejects a negative coordinate | src/engine.rs, src/portal.rs |
-| Pick a position | working | working | partial — read through X11 when `DISPLAY` is set, including before the portal session exists. With only a virtual pointer, or with no XWayland, the position is not reported | src/engine.rs, src/portal.rs |
-| Jitter | working | working | partial — a portal move uses the stream layout. Cursor-mode jitter needs the X11 pointer read; without it the click stays on the seat cursor | src/engine.rs, src/portal.rs |
-| Click limit and time limit | working | working | working | src/engine.rs |
-| Stop when the pointer moves | working | working | partial — needs a pointer read, so it trips only when XWayland can report the position | src/engine.rs, src/portal.rs |
-| Global hotkeys | working | working | missing — the hotkey crate only grabs on X11 | src/hotkeys.rs |
-| Rebind a hotkey | working | working | missing — same limit as the grab | src/ui.rs, src/hotkeys.rs |
-| Dark and light theme | working | working | working | src/ui.rs |
-| Always on top | working | working | missing — core Wayland has no client keep-above, and winit's `set_window_level` is a no-op. Layer-shell would change the window type | src/ui.rs |
-| Window icon | working | working | missing — `set_window_icon` is a no-op. The launcher icon comes from `featherclick.desktop` | src/icon.rs, assets/ |
-| Headless mode | working | working | partial — same click path as the window. The portal dialog, when one is required, is raised on the first run | src/cli.rs, src/engine.rs, src/portal.rs |
-| Saved settings | working | working | working | src/config.rs |
-| Physical pixel coordinates | working — per-monitor DPI v2 | working — X server pixels | not possible — the portal and the virtual pointer both speak the compositor's logical layout, not the framebuffer | src/platform.rs, src/portal.rs |
-| Headless stdout | working — reattach the parent console | working — the process is never detached | working | src/platform.rs |
+| Left, right, and middle click | working | working | partial | `src/engine.rs`, `Cargo.toml` |
+| Single, double, and hold | working | working | partial | `src/engine.rs` |
+| Fixed, uniform, and human-like intervals | working | working | working | `src/engine.rs`, `src/config.rs` |
+| Start delay | working | working | working | `src/engine.rs` |
+| Click at the pointer | working | working | partial | `src/engine.rs` |
+| Click a fixed point | working | working | partial | `src/engine.rs` |
+| Pick the pointer position | working | working | partial | `src/engine.rs`, `src/ui.rs` |
+| Jitter (off, box, ellipse, spread) | working | working | partial | `src/engine.rs` |
+| Click limit | working | working | working | `src/engine.rs` |
+| Time limit | working | working | working | `src/engine.rs` |
+| Stop when the pointer moves | working | working | partial | `src/engine.rs` |
+| Global hotkeys (toggle and pick) | working | working | partial — readable `/dev/input/event*` required; keys are not swallowed | `src/hotkeys.rs`, `src/evdev_keys.rs` |
+| Rebind a hotkey | working | working | partial — requires keyboard access | `src/ui.rs`, `src/hotkeys.rs`, `src/evdev_keys.rs` |
+| Dark / light theme | working | working | working | `src/ui.rs` |
+| Always on top | working | working | not possible | `src/ui.rs` |
+| Window icon | working | working | partial | `src/icon.rs`, `src/main.rs`, `src/wayland_icon.rs`, `assets/featherclick.desktop` |
+| Saved settings | working | working | working | `src/config.rs` |
+| Headless mode | working | working | partial | `src/cli.rs`, `src/engine.rs` |
+| Screen coordinates | working | working | not possible | `src/platform.rs` |
 
-X11 absolute positions go through XTest as 16-bit root coordinates. A point outside ±32767 cannot be addressed. Ordinary layouts fit, so this stays working.
+## Clicking and fixed points
 
-Pointer position on a pure Wayland session, with no XWayland, is not possible: the virtual pointer and the RemoteDesktop portal do not report where the seat cursor is. The closest equivalent is the X11 query used beside the portal.
+Wayland clicks use wlroots' virtual pointer (Sway, Hyprland), or the RemoteDesktop portal on GNOME and KDE. enigo's libei portal client is not compiled in because it aborts when `org.freedesktop.portal.Desktop` is absent; the separate portal client reports errors and falls back to X11.
+
+When both X11 and Wayland are available, clicks use one backend;
+a separate X11 connection can read the pointer position.
+
+A fixed Wayland point maps across the entire xdg-output logical layout,
+including negative coordinates and fractional scaling. The virtual pointer is
+unbound and is the only connection used for clicks. The mapping is unit-tested;
+it has not been tested on a live Wayland compositor. Jitter, hold, double click,
+and headless mode use the same engine.
+
+## Pointer location
+
+The Wayland virtual pointer does not report its position. An X11-only connection
+reads it when available; otherwise Pick, cursor jitter, and stop-on-move report
+that the position is unavailable. X11 reads the pointer directly.
+
+The stop-on-move check itself runs after each click on every platform.
+
+## Hotkeys
+
+`global-hotkey` on X11 uses a grab. On Wayland the listener reads keyboard
+devices without grabbing them, so the focused window also receives the key.
+Access to `/dev/input/event*` is required, typically via the `input` group.
+The on-screen buttons still work without access.
+
+## Always on top
+
+Not possible on Wayland. No standard protocol lets an ordinary client keep a
+window above others. KDE's plasma-window-management protocol has
+`keep_above`, and it says regular clients must not bind it and that only one
+client may. Layer-shell would replace the xdg toplevel winit already created.
+Sway's sticky flag is a different behavior. The checkbox still sends
+`WindowLevel::AlwaysOnTop`; winit ignores it on Wayland. On X11, winit sets
+`_NET_WM_STATE_ABOVE`.
+
+## Window icon
+
+Windows embeds `assets/icon.ico` and winit sets the window icons. X11 sets
+`_NET_WM_ICON` from the same RGBA image (`src/main.rs`).
+
+On Wayland, winit's `set_window_icon` does nothing. This branch attaches the
+icon with `xdg-toplevel-icon-v1` when the compositor offers it, on the
+`wl_display` and `xdg_toplevel` winit already owns (`src/wayland_icon.rs`).
+The buffer is premultiplied ARGB8888. The icon name is `featherclick`. The
+64px image is always sent, plus any edge from 1 to 256 that the compositor
+asks for. If the protocol is absent, taskbars keep the desktop-file icon
+(`assets/featherclick.desktop`). The window does not say so.
+
+## Screen coordinates
+
+Windows asks for per-monitor DPI v2 so coordinates are physical pixels.
+X11 coordinates are pixels. A Wayland client only sees the compositor's
+logical layout and cannot ask for physical pixels. The closest equivalent is
+that logical point.
+
+
+GNOME and KDE use the RemoteDesktop portal when no virtual pointer is available. Permission is requested when a run starts and the restore token is saved with mode 0600. A missing or refused portal falls back to XWayland. Portal clicks use the stream’s logical layout, including negative monitor origins. Picking reads through X11 without opening a portal session.
