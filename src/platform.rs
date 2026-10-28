@@ -85,6 +85,52 @@ impl Drop for TimerResolution {
     }
 }
 
+/// Moves the pointer to a physical pixel on the virtual desktop.
+///
+/// `SendInput` with `MOUSEEVENTF_ABSOLUTE` (what enigo uses for an absolute
+/// move) maps 0..65535 onto the primary monitor only. A second monitor, and
+/// any negative coordinate, never receives the point, and `GetCursorPos`
+/// would then disagree with the coordinate the click was aimed at.
+/// `SetCursorPos` is the same space `GetCursorPos` reports.
+#[cfg(windows)]
+pub(crate) fn set_cursor_pos(x: i32, y: i32) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+
+    fn put(x: i32, y: i32) -> Result<(), String> {
+        if unsafe { SetCursorPos(x, y) } == 0 {
+            Err(std::io::Error::last_os_error().to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn read() -> Result<(i32, i32), String> {
+        let mut point = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut point) } == 0 {
+            Err(std::io::Error::last_os_error().to_string())
+        } else {
+            Ok((point.x, point.y))
+        }
+    }
+
+    put(x, y)?;
+    if read()? == (x, y) {
+        return Ok(());
+    }
+    // The cursor can be nudged between the write and the read. One retry, then
+    // refuse to click somewhere other than the requested pixel.
+    put(x, y)?;
+    let now = read()?;
+    if now == (x, y) {
+        Ok(())
+    } else {
+        Err(format!(
+            "pointer went to {},{} instead of {x},{y}",
+            now.0, now.1
+        ))
+    }
+}
 /// Arranges for the first Ctrl+C to ask the headless session to stop, and for
 /// a second one to terminate the process. Installed only for `--headless`:
 /// the windowed process should keep the default handler so a terminal Ctrl+C

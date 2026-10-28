@@ -235,6 +235,7 @@ impl Run {
             SessionEvent::Captured(point) => println!("{},{}", point.0, point.1),
             SessionEvent::Stopped(reason) => stopped = Some(reason),
             SessionEvent::Started => {}
+            SessionEvent::Warning(message) => eprintln!("featherclick: {message}"),
         };
 
         engine::run_session(

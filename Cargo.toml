@@ -41,7 +41,7 @@ wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland"] }
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Media", "Win32_System_Console", "Win32_Foundation", "Win32_UI_HiDpi"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Media", "Win32_System_Console", "Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 
 [target."cfg(windows)".build-dependencies]
 winresource = "0.1.31"

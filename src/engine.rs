@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use enigo::{Button, Coordinate, Direction, Enigo, InputResult, Mouse, Settings as EnigoSettings};
+#[cfg(any(not(windows), test))]
+use enigo::Coordinate;
+use enigo::{Button, Direction, Enigo, InputResult, Mouse, Settings as EnigoSettings};
 
 use crate::config::{ClickStyle, JitterMode, MouseButton, PositionMode, Settings, TimingMode};
 
@@ -65,6 +67,7 @@ pub enum SessionEvent {
     /// Total clicks sent so far.
     Trigger(u64),
     Captured((i32, i32)),
+    Warning(String),
     Stopped(StopReason),
 }
 
@@ -164,24 +167,95 @@ impl Worker {
     }
 }
 
-/// Connects to the platform input backend. Boxed error text is what the user
-/// needs on a headless Linux box with no X11/Wayland session.
-pub fn connect() -> Result<Enigo, String> {
-    let settings = EnigoSettings {
+/// Display name that is not a parseable X11 display and not a Wayland socket.
+/// Passing it forces that one backend to fail immediately, so the other is
+/// the only connection enigo keeps.
+const ISOLATED_DISPLAY: &str = "featherclick-no-display";
+
+/// One attempt to open an input connection.
+///
+/// `None` leaves that server to the environment. `Some` forces the name enigo
+/// will try, which is how a backend is kept out of the connection.
+struct BackendAttempt {
+    wayland_display: Option<String>,
+    x11_display: Option<String>,
+}
+
+/// Servers to try, in order. Each attempt leaves at most one of the two open.
+///
+/// enigo sends every click to every server it connected, so a session where
+/// both Wayland and XWayland answered would click twice. The first attempt is
+/// Wayland alone, and only when `WAYLAND_DISPLAY` is set; the last is X11
+/// alone, which is also the path on Windows and macOS (those fields are
+/// ignored there).
+fn backend_attempts(wayland_is_set: bool) -> Vec<BackendAttempt> {
+    let mut attempts = Vec::new();
+    if wayland_is_set {
+        attempts.push(BackendAttempt {
+            wayland_display: None,
+            x11_display: Some(ISOLATED_DISPLAY.to_string()),
+        });
+    }
+    attempts.push(BackendAttempt {
+        wayland_display: Some(ISOLATED_DISPLAY.to_string()),
+        x11_display: None,
+    });
+    attempts
+}
+
+fn enigo_settings(attempt: &BackendAttempt) -> EnigoSettings {
+    EnigoSettings {
         // Every extra millisecond of per-event delay is a millisecond off the
         // achievable click rate.
         linux_delay: 0,
+        wayland_display: attempt.wayland_display.clone(),
+        x11_display: attempt.x11_display.clone(),
         ..EnigoSettings::default()
-    };
-    Enigo::new(&settings).map_err(|err| format!("cannot simulate input: {err}"))
+    }
+}
+
+/// Connects to one platform input backend.
+pub fn connect() -> Result<Enigo, String> {
+    #[cfg(target_os = "linux")]
+    let wayland_is_set = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    #[cfg(not(target_os = "linux"))]
+    let wayland_is_set = false;
+
+    let mut last_err = String::from("no display");
+    for attempt in backend_attempts(wayland_is_set) {
+        match Enigo::new(&enigo_settings(&attempt)) {
+            Ok(enigo) => return Ok(enigo),
+            Err(err) => last_err = err.to_string(),
+        }
+    }
+    Err(format!("cannot simulate input: {last_err}"))
+}
+
+/// Opens the input backend if a previous attempt failed. One connection
+/// attempt per call: the error from that attempt is what the UI shows.
+fn ensure_input<'a>(
+    enigo: &'a mut Option<Enigo>,
+    status: &Arc<Mutex<Status>>,
+) -> Option<&'a mut Enigo> {
+    if enigo.is_none() {
+        match connect() {
+            Ok(handle) => *enigo = Some(handle),
+            Err(err) => {
+                status.lock().unwrap_or_else(|e| e.into_inner()).error = Some(err);
+            }
+        }
+    }
+    enigo.as_mut()
 }
 
 fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
-    let mut enigo = connect().ok();
-    if enigo.is_none() {
-        let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
-        guard.error = connect().err();
-    }
+    let mut enigo = match connect() {
+        Ok(enigo) => Some(enigo),
+        Err(err) => {
+            status.lock().unwrap_or_else(|e| e.into_inner()).error = Some(err);
+            None
+        }
+    };
 
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
@@ -191,10 +265,7 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
             Ok(Command::Stop) => {}
             Ok(Command::Capture) => {
                 // Retry the connection: a display may have appeared since launch.
-                if enigo.is_none() {
-                    enigo = connect().ok();
-                }
-                if let Some(handle) = enigo.as_mut() {
+                if let Some(handle) = ensure_input(&mut enigo, status) {
                     capture(handle, &mut |event| apply(status, event));
                 }
             }
@@ -203,23 +274,14 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
                 if !idle {
                     continue;
                 }
-                if enigo.is_none() {
-                    enigo = connect().ok();
-                }
-                match enigo.as_mut() {
-                    None => {
-                        let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.error = connect().err();
-                    }
-                    Some(handle) => {
-                        run_session(
-                            &settings,
-                            rx,
-                            handle,
-                            &mut |event| apply(status, event),
-                            &|| false,
-                        );
-                    }
+                if let Some(handle) = ensure_input(&mut enigo, status) {
+                    run_session(
+                        &settings,
+                        rx,
+                        handle,
+                        &mut |event| apply(status, event),
+                        &|| false,
+                    );
                 }
             }
         }
@@ -244,6 +306,7 @@ fn apply(status: &Arc<Mutex<Status>>, event: SessionEvent) {
             guard.captured = Some(point);
             guard.capture_seq = guard.capture_seq.wrapping_add(1);
         }
+        SessionEvent::Warning(err) => guard.error = Some(err),
         SessionEvent::Stopped(reason) => {
             guard.running = false;
             guard.stopped = Some(Instant::now());
@@ -252,9 +315,10 @@ fn apply(status: &Arc<Mutex<Status>>, event: SessionEvent) {
     }
 }
 
-fn capture(enigo: &mut impl Mouse, sink: &mut dyn FnMut(SessionEvent)) {
-    if let Ok(point) = enigo.location() {
-        sink(SessionEvent::Captured(point));
+fn capture(enigo: &mut impl Pointer, sink: &mut dyn FnMut(SessionEvent)) {
+    match enigo.read_pointer() {
+        Ok(point) => sink(SessionEvent::Captured(point)),
+        Err(err) => sink(SessionEvent::Warning(err)),
     }
 }
 
@@ -266,7 +330,7 @@ enum Polled {
 
 fn poll(
     rx: &Receiver<Command>,
-    enigo: &mut impl Mouse,
+    enigo: &mut impl Pointer,
     sink: &mut dyn FnMut(SessionEvent),
 ) -> Polled {
     loop {
@@ -296,6 +360,159 @@ fn places_pointer(settings: &Settings) -> bool {
     settings.position == PositionMode::Fixed || settings.jitter != JitterMode::Off
 }
 
+/// Cursor jitter is measured from wherever the pointer already is, and
+/// stop-on-move has to watch that pointer. Both need a real reading.
+fn anchor_needs_pointer(settings: &Settings) -> bool {
+    settings.stop_on_move_px > 0
+        || (settings.position == PositionMode::Cursor && settings.jitter != JitterMode::Off)
+}
+
+/// The point repeated clicks are measured from.
+///
+/// `read` is the pointer position when [`anchor_needs_pointer`] is true, and
+/// is ignored otherwise. A failed read is returned rather than replaced with
+/// the saved point: that saved point is often `(0, 0)`, and jitter would then
+/// drag the pointer to the corner.
+fn resolve_anchor(
+    settings: &Settings,
+    read: Result<(i32, i32), String>,
+) -> Result<(i32, i32), String> {
+    match settings.position {
+        PositionMode::Fixed => {
+            if settings.stop_on_move_px > 0 {
+                read?;
+            }
+            Ok(settings.point)
+        }
+        PositionMode::Cursor => {
+            if settings.jitter == JitterMode::Off && settings.stop_on_move_px == 0 {
+                Ok(settings.point)
+            } else {
+                read
+            }
+        }
+    }
+}
+
+/// Reads the pointer in the same pixel space a click is aimed at.
+///
+/// Wayland's virtual pointer cannot report a position (enigo returns "Not
+/// implemented"). XWayland's root window can, so a second X11-only connection
+/// is used for the read and never for clicks.
+fn pointer_location(enigo: &Enigo) -> Result<(i32, i32), String> {
+    match enigo.location() {
+        Ok(point) => Ok(point),
+        Err(err) => location_fallback(err.to_string()),
+    }
+}
+
+fn location_fallback(primary: String) -> Result<(i32, i32), String> {
+    #[cfg(target_os = "linux")]
+    {
+        match x11_pointer_fallback() {
+            Ok(point) => Ok(point),
+            Err(fallback) => Err(explain_location(&primary, Some(&fallback))),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(explain_location(&primary, None))
+    }
+}
+
+fn explain_location(primary: &str, x11: Option<&str>) -> String {
+    #[cfg(target_os = "linux")]
+    if primary.contains("Not implemented") {
+        return match x11 {
+            None => "cannot read the pointer position: Wayland does not report it, and no X11 display is connected".to_string(),
+            Some(err) => format!(
+                "cannot read the pointer position: Wayland does not report it, and X11 failed ({err})"
+            ),
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = x11;
+    }
+    format!("cannot read the pointer position: {primary}")
+}
+
+/// X11 pointer read that does not join the click connection.
+///
+/// The connection is kept on this thread. Opening one per sample would add a
+/// full X handshake to every click, and stop-on-move samples on that loop.
+#[cfg(target_os = "linux")]
+fn x11_pointer_fallback() -> Result<(i32, i32), String> {
+    use std::cell::RefCell;
+
+    if std::env::var_os("DISPLAY").is_none() {
+        return Err("DISPLAY is not set".into());
+    }
+
+    struct Slot {
+        enigo: Option<Enigo>,
+        error: Option<String>,
+    }
+
+    thread_local! {
+        static LOCATOR: RefCell<Slot> = const { RefCell::new(Slot { enigo: None, error: None }) };
+    }
+
+    LOCATOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.enigo.is_none() && slot.error.is_none() {
+            let settings = enigo_settings(&BackendAttempt {
+                wayland_display: Some(ISOLATED_DISPLAY.to_string()),
+                x11_display: None,
+            });
+            match Enigo::new(&settings) {
+                Ok(enigo) => slot.enigo = Some(enigo),
+                Err(err) => slot.error = Some(err.to_string()),
+            }
+        }
+        if let Some(enigo) = slot.enigo.as_ref() {
+            return enigo.location().map_err(|err| err.to_string());
+        }
+        Err(slot
+            .error
+            .clone()
+            .unwrap_or_else(|| "could not connect to X11".to_string()))
+    })
+}
+
+/// Puts the pointer on a physical pixel.
+///
+/// On Windows, enigo's absolute move normalises into the primary monitor, so
+/// a point on any other monitor never lands and would not match
+/// `GetCursorPos`. `SetCursorPos` uses that virtual-desktop space.
+fn place_pointer(enigo: &mut Enigo, x: i32, y: i32) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let _ = enigo;
+        crate::platform::set_cursor_pos(x, y)
+    }
+    #[cfg(not(windows))]
+    {
+        enigo
+            .move_mouse(x, y, Coordinate::Abs)
+            .map_err(|err| err.to_string())
+    }
+}
+
+pub(crate) trait Pointer: Mouse {
+    fn read_pointer(&self) -> Result<(i32, i32), String>;
+    fn place(&mut self, x: i32, y: i32) -> Result<(), String>;
+}
+
+impl Pointer for Enigo {
+    fn read_pointer(&self) -> Result<(i32, i32), String> {
+        pointer_location(self)
+    }
+    fn place(&mut self, x: i32, y: i32) -> Result<(), String> {
+        place_pointer(self, x, y)
+    }
+}
+
 /// `threshold` of 0 is off. A point sitting on the radius is still inside:
 /// only a strict departure counts, compared in squared pixels so the old
 /// `sqrt as i32` truncation cannot hide one.
@@ -303,9 +520,9 @@ fn moved_away(now: (i32, i32), parked: (i32, i32), threshold: u32) -> bool {
     if threshold == 0 {
         return false;
     }
-    let dx = i64::from(now.0) - i64::from(parked.0);
-    let dy = i64::from(now.1) - i64::from(parked.1);
-    let limit = i64::from(threshold);
+    let dx = i128::from(now.0) - i128::from(parked.0);
+    let dy = i128::from(now.1) - i128::from(parked.1);
+    let limit = i128::from(threshold);
     dx * dx + dy * dy > limit * limit
 }
 
@@ -318,7 +535,7 @@ struct ClickOutcome {
 
 /// One clicking session. The [`Waiter`] stays outside so a wait can borrow it
 /// while the abort check borrows the session.
-struct Run<'a, M: Mouse> {
+struct Run<'a, M: Pointer> {
     settings: &'a Settings,
     started: Instant,
     /// Where the pointer is allowed to rest. `None` until we have a reference:
@@ -332,7 +549,7 @@ struct Run<'a, M: Mouse> {
     interrupt: &'a dyn Fn() -> bool,
 }
 
-impl<M: Mouse> Run<'_, M> {
+impl<M: Pointer> Run<'_, M> {
     fn finish(&mut self, reason: StopReason) {
         (self.sink)(SessionEvent::Stopped(reason));
     }
@@ -349,7 +566,7 @@ impl<M: Mouse> Run<'_, M> {
         if let Some(parked) = self.parked {
             // A failed read is not a move: losing the pointer for one sample
             // should not end an otherwise healthy run.
-            if let Ok(now) = self.enigo.location()
+            if let Ok(now) = self.enigo.read_pointer()
                 && moved_away(now, parked, self.settings.stop_on_move_px)
             {
                 return Some(StopReason::MouseMoved);
@@ -366,34 +583,36 @@ impl<M: Mouse> Run<'_, M> {
         waiter: &mut Waiter,
         target: (i32, i32),
         clicks_so_far: u64,
-    ) -> InputResult<ClickOutcome> {
+    ) -> Result<ClickOutcome, String> {
         if places_pointer(self.settings) {
-            self.enigo.move_mouse(target.0, target.1, Coordinate::Abs)?;
+            self.enigo.place(target.0, target.1)?;
         }
         let button = Button::from(self.settings.button);
         match self.settings.style {
             ClickStyle::Single => {
-                press_release(self.enigo, button)?;
+                press_release(self.enigo, button).map_err(|err| err.to_string())?;
                 Ok(ClickOutcome {
                     presses: presses_per_trigger(ClickStyle::Single),
                     stop: None,
                 })
             }
             ClickStyle::Hold => {
-                self.enigo.button(button, Direction::Press)?;
+                self.enigo
+                    .button(button, Direction::Press)
+                    .map_err(|err| err.to_string())?;
                 let deadline =
                     Instant::now() + Duration::from_millis(u64::from(self.settings.hold_ms));
                 let stop = waiter.wait(deadline, &mut || self.stop_check());
                 // Every path after a successful press releases, including a
                 // stop that arrived during the hold.
-                release_button(self.enigo, button)?;
+                release_button(self.enigo, button).map_err(|err| err.to_string())?;
                 Ok(ClickOutcome {
                     presses: presses_per_trigger(ClickStyle::Hold),
                     stop,
                 })
             }
             ClickStyle::Double => {
-                press_release(self.enigo, button)?;
+                press_release(self.enigo, button).map_err(|err| err.to_string())?;
                 // The second press is its own click. Skip it when the cap is
                 // already met, or when a stop arrives in the gap.
                 if click_limit_reached(self.settings, clicks_so_far + 1) {
@@ -409,7 +628,7 @@ impl<M: Mouse> Run<'_, M> {
                         stop: Some(stop),
                     });
                 }
-                press_release(self.enigo, button)?;
+                press_release(self.enigo, button).map_err(|err| err.to_string())?;
                 Ok(ClickOutcome {
                     presses: presses_per_trigger(ClickStyle::Double),
                     stop: None,
@@ -424,7 +643,7 @@ impl<M: Mouse> Run<'_, M> {
 pub(crate) fn run_session(
     settings: &Settings,
     rx: &Receiver<Command>,
-    enigo: &mut impl Mouse,
+    enigo: &mut impl Pointer,
     sink: &mut dyn FnMut(SessionEvent),
     interrupt: &dyn Fn() -> bool,
 ) {
@@ -453,21 +672,21 @@ pub(crate) fn run_session(
         }
     }
 
-    // Where jitter is measured from. Captured once, so repeated clicks never
-    // drift away from the intended spot. When this run does not move the
-    // pointer, it is also the stop-on-move reference.
-    let anchor = match settings.position {
-        PositionMode::Fixed => settings.point,
-        PositionMode::Cursor => match run.enigo.location() {
-            Ok(point) => {
-                if settings.stop_on_move_px > 0 && !places_pointer(settings) {
-                    run.parked = Some(point);
-                }
-                point
-            }
-            Err(_) => settings.point,
-        },
+    let read = if anchor_needs_pointer(settings) {
+        run.enigo.read_pointer()
+    } else {
+        Ok(settings.point)
     };
+    let anchor = match resolve_anchor(settings, read) {
+        Ok(point) => point,
+        Err(err) => {
+            run.finish(StopReason::Error(err));
+            return;
+        }
+    };
+    if settings.stop_on_move_px > 0 && !places_pointer(settings) {
+        run.parked = Some(anchor);
+    }
 
     let mut clicks: u64 = 0;
     let mut next = Instant::now();
@@ -1043,7 +1262,7 @@ mod tests {
 
         fn location(&self) -> InputResult<(i32, i32)> {
             let mut inner = self.inner.borrow_mut();
-            if inner.fail_location {
+            if inner.fail_location && inner.locations > 0 {
                 return Err(InputError::Simulate("no pointer"));
             }
             inner.locations += 1;
@@ -1054,6 +1273,16 @@ mod tests {
                 return Ok(inner.jump);
             }
             Ok(inner.pos)
+        }
+    }
+
+    impl Pointer for FakePointer {
+        fn read_pointer(&self) -> Result<(i32, i32), String> {
+            self.location().map_err(|err| err.to_string())
+        }
+        fn place(&mut self, x: i32, y: i32) -> Result<(), String> {
+            self.move_mouse(x, y, Coordinate::Abs)
+                .map_err(|err| err.to_string())
         }
     }
 
@@ -1305,6 +1534,118 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(500),
             "interrupt waited out the start delay: {elapsed:?}"
+        );
+    }
+    #[test]
+    fn each_connection_attempt_opens_at_most_one_server() {
+        let wayland = backend_attempts(true);
+        assert_eq!(wayland.len(), 2, "Wayland is tried before X11");
+        assert!(
+            wayland[0].wayland_display.is_none() && wayland[0].x11_display.is_some(),
+            "the first attempt must not also open X11"
+        );
+        assert!(
+            wayland[1].wayland_display.is_some() && wayland[1].x11_display.is_none(),
+            "the X11 fallback must not also open Wayland"
+        );
+
+        let x11_only = backend_attempts(false);
+        assert_eq!(x11_only.len(), 1);
+        assert!(x11_only[0].wayland_display.is_some());
+        assert!(x11_only[0].x11_display.is_none());
+
+        for attempt in wayland.iter().chain(&x11_only) {
+            assert!(
+                attempt.wayland_display.is_some() || attempt.x11_display.is_some(),
+                "an attempt that names neither server is how both end up connected"
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_uses_a_real_pointer_only_when_the_run_needs_one() {
+        let mut s = settings();
+        s.position = PositionMode::Cursor;
+        s.jitter = JitterMode::Off;
+        s.stop_on_move_px = 0;
+        s.point = (9, 9);
+        assert!(!anchor_needs_pointer(&s));
+        assert!(!places_pointer(&s));
+        assert_eq!(
+            resolve_anchor(&s, Err("no pointer".into())).unwrap(),
+            (9, 9),
+            "cursor mode that does not move can run without a reading"
+        );
+
+        s.jitter = JitterMode::Rectangle;
+        assert!(anchor_needs_pointer(&s));
+        assert!(places_pointer(&s));
+        let err = resolve_anchor(&s, Err("no pointer".into())).unwrap_err();
+        assert!(err.contains("no pointer"), "{err}");
+        assert_eq!(resolve_anchor(&s, Ok((3, 4))).unwrap(), (3, 4));
+
+        s.jitter = JitterMode::Off;
+        s.stop_on_move_px = 5;
+        assert!(anchor_needs_pointer(&s));
+        assert_eq!(resolve_anchor(&s, Ok((3, 4))).unwrap(), (3, 4));
+
+        s.position = PositionMode::Fixed;
+        s.point = (10, 20);
+        s.stop_on_move_px = 0;
+        assert!(!anchor_needs_pointer(&s));
+        assert!(places_pointer(&s));
+        assert_eq!(
+            resolve_anchor(&s, Err("no pointer".into())).unwrap(),
+            (10, 20)
+        );
+
+        s.stop_on_move_px = 8;
+        assert!(anchor_needs_pointer(&s));
+        let err = resolve_anchor(&s, Err("gone".into())).unwrap_err();
+        assert!(err.contains("gone"), "{err}");
+        assert_eq!(
+            resolve_anchor(&s, Ok((1, 1))).unwrap(),
+            (10, 20),
+            "a fixed target stays the saved point once the pointer can be watched"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wayland_location_failure_names_the_x11_fallback() {
+        let missing = explain_location("simulating input failed: (Not implemented yet)", None);
+        assert!(missing.contains("Wayland does not report it"), "{missing}");
+        assert!(missing.contains("no X11 display"), "{missing}");
+
+        let failed = explain_location(
+            "simulating input failed: (Not implemented yet)",
+            Some("DISPLAY is not set"),
+        );
+        assert!(failed.contains("X11 failed"), "{failed}");
+        assert!(failed.contains("DISPLAY is not set"), "{failed}");
+
+        let other = explain_location("connection reset", Some("ignored"));
+        assert_eq!(other, "cannot read the pointer position: connection reset");
+    }
+
+    /// Moves the pointer. Run under Xvfb, not on a desktop session:
+    /// `xvfb-run -a cargo test -- --ignored pointer_placement`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "moves the pointer; run under xvfb"]
+    fn pointer_placement_round_trips_on_x11() {
+        let mut enigo = connect().expect("Xvfb should accept an X11 connection");
+        let target = (80, 60);
+        place_pointer(&mut enigo, target.0, target.1).expect("X11 move");
+        let seen = pointer_location(&enigo).expect("X11 read");
+        assert_eq!(
+            seen, target,
+            "the click connection did not land on the requested pixel"
+        );
+        let via_fallback = x11_pointer_fallback().expect("X11 fallback read");
+        assert_eq!(
+            via_fallback, target,
+            "the position reader and the click connection disagree"
         );
     }
 }

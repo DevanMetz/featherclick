@@ -65,7 +65,7 @@ install -Dm644 featherclick.png ~/.local/share/icons/hicolor/256x256/apps/feathe
 | --- | --- | --- | --- | --- |
 | Clicking | ✅ | ✅ (Accessibility permission) | ✅ | ✅ wlroots only |
 | Global hotkeys | ✅ | ✅ | ✅ | ❌ — use the buttons |
-| Picking a position | ✅ | ✅ | ✅ | ✅ |
+| Picking a position | ✅ | ✅ | ✅ | ✅ via XWayland |
 
 On Wayland, clicking uses the compositor's virtual-pointer protocol, which
 wlroots-based compositors (Sway, Hyprland) provide. GNOME and KDE are not
@@ -73,9 +73,13 @@ covered: their only input path is the RemoteDesktop portal, and the upstream
 portal client aborts the process when no portal is present, so it is
 deliberately not compiled in — a crash on launch is worse than a documented
 gap. On compositors without virtual-pointer support, clicks still reach
-XWayland applications. Wayland has no equivalent of X11's global grabs, so
-hotkeys are unavailable there. With no X11 display the window says so, and
-the on-screen buttons are the way to drive it.
+XWayland applications. A click is sent to one server. When both Wayland and
+X11 are available, the virtual pointer clicks and X11 is only asked where
+the pointer is, because Wayland has no protocol for that. Pick, cursor
+jitter and stop-on-move need that reading and say so when it is missing.
+Wayland has no equivalent of X11's global grabs, so hotkeys are unavailable
+there. With no X11 display the window says so, and the on-screen buttons
+are the way to drive it.
 
 ## Using the window
 
@@ -137,7 +141,9 @@ input backend could not be reached or failed during a run, and `2` for invalid
 arguments. A second Ctrl+C exits immediately.
 
 Coordinates are physical screen pixels, measured from the top-left of the
-primary display.
+primary display, including other monitors. A display to the left or above
+the primary has negative coordinates. Windows and X11 accept those. On
+Wayland's virtual pointer a negative point is an error.
 
 ## Configuration
 
