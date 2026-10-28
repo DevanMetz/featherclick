@@ -63,19 +63,16 @@ install -Dm644 featherclick.png ~/.local/share/icons/hicolor/256x256/apps/feathe
 
 | | Windows 10/11 | macOS 11+ | Linux (X11) | Linux (Wayland) |
 | --- | --- | --- | --- | --- |
-| Clicking | ✅ | ✅ (Accessibility permission) | ✅ | ✅ wlroots only |
+| Clicking | ✅ | ✅ (Accessibility permission) | ✅ | ✅ wlroots, or the portal on GNOME and KDE |
 | Global hotkeys | ✅ | ✅ | ✅ | ✅ with access to `/dev/input` |
 | Picking a position | ✅ | ✅ | ✅ | ✅ via XWayland |
 
-On Wayland, clicking uses the compositor's virtual-pointer protocol, which
+On GNOME and KDE, clicking uses the RemoteDesktop portal. Permission is requested when a run starts and the grant is saved for later runs. If the portal fails, XWayland is used when available. Portal coordinates use the stream’s logical layout.
+
+On wlroots, clicking uses the compositor's virtual-pointer protocol, which
 wlroots-based compositors (Sway, Hyprland) provide. Fixed points map across
 the entire xdg-output logical layout, including monitors left of or above the
-origin and fractional scaling. GNOME and KDE are not
-covered: their only input path is the RemoteDesktop portal, and the upstream
-portal client aborts the process when no portal is present, so it is
-deliberately not compiled in — a crash on launch is worse than a documented
-gap. On compositors without virtual-pointer support, clicks still reach
-XWayland applications. A click is sent to one server. When both Wayland and
+origin and fractional scaling. On compositors without virtual-pointer support, the portal is used, with XWayland as a fallback. A click is sent to one server. When both Wayland and
 X11 are available, the virtual pointer clicks and X11 is only asked where
 the pointer is, because Wayland has no protocol for that. Pick, cursor
 jitter and stop-on-move need that reading and say so when it is missing.

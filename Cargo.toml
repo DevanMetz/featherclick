@@ -25,12 +25,15 @@ libc = "0.2.189"
 # speaks wlroots' virtual-pointer protocol itself so a click can be aimed
 # across the whole layout; these crates are the same ones enigo already uses.
 #
-# enigo's libei backend (GNOME/KDE's RemoteDesktop portal) is deliberately NOT
-# enabled: its portal client unwraps the connection result, so it aborts the
-# process on any system without org.freedesktop.portal.Desktop - headless
-# containers and minimal window managers included. Crashing on launch is worse
-# than a documented limitation.
+# enigo's libei backend is deliberately not enabled: its portal client unwraps
+# the connection result, so it aborts the process on any system without
+# org.freedesktop.portal.Desktop. GNOME and KDE are reached by our own
+# RemoteDesktop client instead, which reports the failure and falls back to X11.
 enigo = { version = "0.6.1", features = ["wayland"] }
+# Pure Rust D-Bus, so the binary still has no runtime dependency on libdbus.
+# `service` builds the in-crate portal stand-in the tests talk to.
+zbus = { version = "6.1.0", default-features = false, features = ["default-rt", "proxy", "service"] }
+ordered-stream = "0.2"
 raw-window-handle = "0.6"
 wayland-backend = { version = "0.3.17", features = ["client_system"] }
 wayland-client = "0.31.15"

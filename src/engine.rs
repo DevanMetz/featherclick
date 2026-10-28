@@ -309,14 +309,22 @@ fn worker_loop(
     status: &Arc<Mutex<Status>>,
     wake: &(dyn Fn() + Send + Sync),
 ) {
-    let mut enigo = match connect() {
-        Ok(enigo) => Some(enigo),
-        Err(err) => {
-            // One attempt. A second connection here used to be only for the
-            // message, and a success on that retry left the thread with neither
-            // a handle nor an error.
-            note_error(status, wake, err);
-            None
+    #[cfg(target_os = "linux")]
+    let deferred = crate::wayland_probe::prefer_portal();
+    #[cfg(not(target_os = "linux"))]
+    let deferred = false;
+    let mut enigo = if deferred {
+        None
+    } else {
+        match connect() {
+            Ok(enigo) => Some(enigo),
+            Err(err) => {
+                // One attempt. A second connection here used to be only for the
+                // message, and a success on that retry left the thread with neither
+                // a handle nor an error.
+                note_error(status, wake, err);
+                None
+            }
         }
     };
 
@@ -329,6 +337,14 @@ fn worker_loop(
             Ok(Command::Stop) => {}
             Ok(Command::Window(update)) => shield = update,
             Ok(Command::Capture) => {
+                #[cfg(target_os = "linux")]
+                if enigo.is_none() && deferred {
+                    match crate::portal::read_cursor() {
+                        Ok(point) => apply(status, SessionEvent::Captured(point), wake),
+                        Err(err) => apply(status, SessionEvent::Warning(err), wake),
+                    }
+                    continue;
+                }
                 // Retry the connection: a display may have appeared since launch.
                 if let Some(handle) = ensure_input(&mut enigo, status, wake) {
                     capture(handle, &mut |event| apply(status, event, wake));

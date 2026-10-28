@@ -20,9 +20,20 @@ enum Inner {
     Enigo(Box<Enigo>),
     #[cfg(target_os = "linux")]
     Wayland(Box<WaylandPointer>),
+    #[cfg(target_os = "linux")]
+    Portal(Box<crate::portal::PortalPointer>),
 }
 
 pub fn connect() -> Result<Input, String> {
+    #[cfg(target_os = "linux")]
+    if crate::wayland_probe::prefer_portal() {
+        return match crate::portal::PortalPointer::open() {
+            Ok(portal) => Ok(Input {
+                inner: Inner::Portal(Box::new(portal)),
+            }),
+            Err(err) => enigo().map_err(|_| err),
+        };
+    }
     #[cfg(target_os = "linux")]
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         match WaylandPointer::connect() {
@@ -62,6 +73,8 @@ impl Input {
         match &self.inner {
             Inner::Enigo(enigo) => enigo.location().map_err(|err| err.to_string()),
             #[cfg(target_os = "linux")]
+            Inner::Portal(pointer) => pointer.location(),
+            #[cfg(target_os = "linux")]
             Inner::Wayland(_) => {
                 Err("the wayland virtual pointer does not report a position".to_string())
             }
@@ -75,6 +88,8 @@ impl Input {
                 .map_err(|err| err.to_string()),
             #[cfg(target_os = "linux")]
             Inner::Wayland(pointer) => pointer.move_abs(x, y),
+            #[cfg(target_os = "linux")]
+            Inner::Portal(pointer) => pointer.move_abs(x, y),
         }
     }
 
@@ -85,6 +100,8 @@ impl Input {
                 .map_err(|err| err.to_string()),
             #[cfg(target_os = "linux")]
             Inner::Wayland(pointer) => wayland_button(pointer, button, direction),
+            #[cfg(target_os = "linux")]
+            Inner::Portal(pointer) => pointer.button(button, direction),
         }
     }
 }

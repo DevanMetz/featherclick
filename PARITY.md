@@ -33,11 +33,9 @@ equivalent is named in the note.
 
 ## Clicking and fixed points
 
-Wayland clicks go through wlroots' virtual pointer (Sway, Hyprland). GNOME and
-KDE do not offer that protocol. enigo's libei portal client is not compiled
-in: it aborts when `org.freedesktop.portal.Desktop` is absent (`Cargo.toml`).
+Wayland clicks use wlroots' virtual pointer (Sway, Hyprland), or the RemoteDesktop portal on GNOME and KDE. enigo's libei portal client is not compiled in because it aborts when `org.freedesktop.portal.Desktop` is absent; the separate portal client reports errors and falls back to X11.
 
-When both X11 and Wayland are available, clicks use only the virtual pointer;
+When both X11 and Wayland are available, clicks use one backend;
 a separate X11 connection can read the pointer position.
 
 A fixed Wayland point maps across the entire xdg-output logical layout,
@@ -90,3 +88,6 @@ Windows asks for per-monitor DPI v2 so coordinates are physical pixels.
 X11 coordinates are pixels. A Wayland client only sees the compositor's
 logical layout and cannot ask for physical pixels. The closest equivalent is
 that logical point.
+
+
+GNOME and KDE use the RemoteDesktop portal when no virtual pointer is available. Permission is requested when a run starts and the restore token is saved with mode 0600. A missing or refused portal falls back to XWayland. Portal clicks use the stream’s logical layout, including negative monitor origins. Picking reads through X11 without opening a portal session.

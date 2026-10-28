@@ -13,9 +13,13 @@ mod icon;
 mod input;
 mod platform;
 mod pointer_layout;
+#[cfg(target_os = "linux")]
+mod portal;
 mod ui;
 #[cfg(target_os = "linux")]
 mod wayland_icon;
+#[cfg(target_os = "linux")]
+mod wayland_probe;
 
 #[cfg(target_os = "linux")]
 mod wayland_pointer;
