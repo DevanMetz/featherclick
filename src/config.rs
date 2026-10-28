@@ -1,9 +1,7 @@
 //! User settings and their on-disk representation.
 //!
-//! A file that does not parse is reported and left byte for byte. Callers
-//! decide whether that is fatal. A write goes to a temporary file in the same
-//! directory, is flushed, and only then replaces the destination, so a crash
-//! leaves the previous file in place.
+//! Invalid files are backed up before falling back to defaults. Writes use a
+//! private temporary file in the same directory and atomically replace the file.
 
 use std::path::{Path, PathBuf};
 
@@ -132,27 +130,39 @@ pub struct Settings {
     // Clicking
     pub button: MouseButton,
     pub style: ClickStyle,
+    #[serde(deserialize_with = "clamped_u32")]
     pub hold_ms: u32,
 
     // Timing
     pub timing: TimingMode,
+    #[serde(deserialize_with = "clamped_u32")]
     pub interval_ms: u32,
+    #[serde(deserialize_with = "clamped_u32")]
     pub interval_min_ms: u32,
+    #[serde(deserialize_with = "clamped_u32")]
     pub interval_max_ms: u32,
+    #[serde(deserialize_with = "clamped_u32")]
     pub interval_mean_ms: u32,
+    #[serde(deserialize_with = "clamped_u32")]
     pub interval_std_ms: u32,
+    #[serde(deserialize_with = "clamped_u32")]
     pub start_delay_ms: u32,
 
     // Position
     pub position: PositionMode,
     pub point: (i32, i32),
     pub jitter: JitterMode,
+    #[serde(deserialize_with = "clamped_u32")]
     pub jitter_x: u32,
+    #[serde(deserialize_with = "clamped_u32")]
     pub jitter_y: u32,
 
     // Limits
+    #[serde(deserialize_with = "clamped_u64")]
     pub max_clicks: u64,
+    #[serde(deserialize_with = "clamped_u32")]
     pub max_seconds: u32,
+    #[serde(deserialize_with = "clamped_u32")]
     pub stop_on_move_px: u32,
 
     // Hotkeys, stored in the `HotKey` string form ("F6", "Ctrl+Shift+K").
@@ -162,6 +172,23 @@ pub struct Settings {
     // Window
     pub theme: Theme,
     pub always_on_top: bool,
+}
+
+// Read signed and oversized JSON numbers without discarding unrelated settings.
+// Per-field operational limits are applied by `sanitize` after deserialization.
+fn clamped_u64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let number = serde_json::Number::deserialize(deserializer)?;
+    if let Some(value) = number.as_u64() {
+        return Ok(value);
+    }
+    let value = number
+        .as_f64()
+        .ok_or_else(|| serde::de::Error::custom("expected a number"))?;
+    Ok(value as u64)
+}
+
+fn clamped_u32<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    clamped_u64(deserializer).map(|value| value.min(u32::MAX as u64) as u32)
 }
 
 impl Default for Settings {
@@ -242,7 +269,7 @@ impl Settings {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadOutcome {
     pub settings: Settings,
-    /// Set when a file was present but could not be used. The file is unchanged.
+    /// One diagnostic when a file could not be used, including backup failures.
     pub error: Option<String>,
 }
 
@@ -264,8 +291,8 @@ pub fn save_with_backup(settings: &Settings) -> std::io::Result<()> {
 }
 
 fn read_at(path: &Path) -> LoadOutcome {
-    match std::fs::read_to_string(path) {
-        Ok(raw) => match serde_json::from_str::<Settings>(&raw) {
+    match std::fs::read(path) {
+        Ok(raw) => match serde_json::from_slice::<Settings>(&raw) {
             Ok(mut settings) => {
                 settings.sanitize();
                 LoadOutcome {
@@ -273,10 +300,20 @@ fn read_at(path: &Path) -> LoadOutcome {
                     error: None,
                 }
             }
-            Err(err) => LoadOutcome {
-                settings: Settings::default(),
-                error: Some(format!("cannot parse {}: {err}", path.display())),
-            },
+            Err(err) => {
+                let backup = write_atomic(&backup_path(path), &raw);
+                let detail = match backup {
+                    Ok(()) => format!("backup saved to {}", backup_path(path).display()),
+                    Err(error) => format!("cannot save backup: {error}"),
+                };
+                LoadOutcome {
+                    settings: Settings::default(),
+                    error: Some(format!(
+                        "cannot parse {}: {err}; {detail}; using defaults",
+                        path.display()
+                    )),
+                }
+            }
         },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => LoadOutcome {
             settings: Settings::default(),
@@ -284,14 +321,17 @@ fn read_at(path: &Path) -> LoadOutcome {
         },
         Err(err) => LoadOutcome {
             settings: Settings::default(),
-            error: Some(format!("cannot read {}: {err}", path.display())),
+            error: Some(format!(
+                "cannot read {}: {err}; using defaults",
+                path.display()
+            )),
         },
     }
 }
 
 fn write_at(path: &Path, settings: &Settings, backup: bool) -> std::io::Result<()> {
     if backup && path.is_file() {
-        std::fs::copy(path, backup_path(path))?;
+        write_atomic(&backup_path(path), &std::fs::read(path)?)?;
     }
     // Persist the clamped values, so the next launch does not depend on
     // repairing the same hand edit again. The caller's copy is left as it is.
@@ -305,20 +345,52 @@ fn write_at(path: &Path, settings: &Settings, backup: bool) -> std::io::Result<(
 /// then keeps the previous file, and the new bytes are already durable once
 /// the name points at them.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = temp_path(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    // Start with a unique sibling on every save, including after a restart.
+    // create_new prevents truncating a stale file or following a symlink.
+    let (tmp, mut file) = loop {
+        let tmp = sibling(
+            path,
+            &format!(
+                ".{}.{:032x}.tmp",
+                std::process::id(),
+                rand::random::<u128>()
+            ),
+        );
+        match options.open(&tmp) {
+            Ok(file) => break (tmp, file),
+            // Windows can report PermissionDenied for an existing directory.
+            // Retry only collisions; real access errors must reach the caller.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    || (error.kind() == std::io::ErrorKind::PermissionDenied
+                        && std::fs::symlink_metadata(&tmp).is_ok()) => {}
+            Err(error) => return Err(error),
+        }
+    };
     let result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp)?;
         std::io::Write::write_all(&mut file, bytes)?;
         file.sync_all()?;
         Ok(())
     })();
+    drop(file);
     if let Err(err) = result {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }
+    // Rust uses replacement semantics on Windows too. Do not remove the old
+    // file first: a failed replacement must preserve the previous settings.
     if let Err(err) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
@@ -328,10 +400,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 fn backup_path(path: &Path) -> PathBuf {
     sibling(path, ".bak")
-}
-
-fn temp_path(path: &Path) -> PathBuf {
-    sibling(path, ".tmp")
 }
 
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
@@ -459,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_does_not_parse_is_left_byte_for_byte() {
+    fn a_file_that_does_not_parse_is_backed_up_byte_for_byte() {
         let dir = Scratch::new();
         let path = dir.path.join("config.json");
         let raw = b"{not json\n";
@@ -471,6 +539,7 @@ mod tests {
         assert!(error.contains("config.json"), "{error}");
         assert_eq!(outcome.settings, Settings::default());
         assert_eq!(std::fs::read(&path).unwrap(), raw);
+        assert_eq!(std::fs::read(backup_path(&path)).unwrap(), raw);
     }
 
     #[test]
@@ -486,7 +555,10 @@ mod tests {
 
         write_at(&path, &settings, false).unwrap();
 
-        assert!(!temp_path(&path).exists(), "temp file left behind");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
         assert!(!backup_path(&path).exists());
         let outcome = read_at(&path);
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
@@ -508,7 +580,7 @@ mod tests {
 
         assert_eq!(std::fs::read(backup_path(&path)).unwrap(), raw);
         assert!(read_at(&path).error.is_none());
-        assert!(!temp_path(&path).exists());
+        assert_eq!(std::fs::read_dir(&dir.path).unwrap().count(), 2);
     }
 
     #[test]
@@ -517,24 +589,129 @@ mod tests {
         let path = dir.path.join("config.json");
         let raw = b"{not json\n";
         std::fs::write(&path, raw).unwrap();
-        // `copy` refuses a directory destination, on every platform.
+        // A file cannot replace a directory, on any platform.
         std::fs::create_dir(backup_path(&path)).unwrap();
 
         let err = write_at(&path, &Settings::default(), true).unwrap_err();
         assert_eq!(std::fs::read(&path).unwrap(), raw, "{err}");
-        assert!(!temp_path(&path).exists());
+        assert_eq!(std::fs::read_dir(&dir.path).unwrap().count(), 2);
     }
 
     #[test]
-    fn a_failed_write_keeps_both_the_original_and_its_backup() {
+    fn stale_temporary_files_do_not_block_saving() {
         let dir = Scratch::new();
         let path = dir.path.join("config.json");
         let raw = b"{not json\n";
         std::fs::write(&path, raw).unwrap();
-        std::fs::create_dir(temp_path(&path)).unwrap();
+        std::fs::create_dir(sibling(&path, ".tmp")).unwrap();
 
-        let err = write_at(&path, &Settings::default(), true).unwrap_err();
-        assert_eq!(std::fs::read(&path).unwrap(), raw, "{err}");
+        write_at(&path, &Settings::default(), true).unwrap();
+        assert!(read_at(&path).error.is_none());
+        assert!(
+            sibling(&path, ".tmp").is_dir(),
+            "existing temp path is untouched"
+        );
         assert_eq!(std::fs::read(backup_path(&path)).unwrap(), raw);
+        assert_eq!(std::fs::read_dir(&dir.path).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn repeated_saves_replace_settings_and_backups_without_leaking_temps() {
+        let dir = Scratch::new();
+        let path = dir.path.join("config.json");
+        let stale = sibling(&path, ".tmp");
+        std::fs::write(&stale, b"stale save").unwrap();
+        let mut settings = Settings::default();
+        write_at(&path, &settings, false).unwrap();
+        for interval in [123, 456, 789] {
+            let previous = std::fs::read(&path).unwrap();
+            settings.interval_ms = interval;
+            write_at(&path, &settings, true).unwrap();
+            assert_eq!(read_at(&path).settings, settings);
+            assert_eq!(std::fs::read(backup_path(&path)).unwrap(), previous);
+            assert_eq!(std::fs::read(&stale).unwrap(), b"stale save");
+            assert_eq!(std::fs::read_dir(&dir.path).unwrap().count(), 3);
+        }
+    }
+
+    #[test]
+    fn loading_clamps_negative_and_oversized_numbers_and_preserves_zero_limits() {
+        let dir = Scratch::new();
+        let path = dir.path.join("config.json");
+        std::fs::write(&path, r#"{"interval_ms":-20,"hold_ms":-1,"jitter_x":1e30,"jitter_y":999999,"max_clicks":0,"max_seconds":0,"interval_mean_ms":-9,"interval_std_ms":900,"button":"right"}"#).unwrap();
+        let loaded = read_at(&path);
+        assert!(loaded.error.is_none());
+        assert_eq!(loaded.settings.interval_ms, 1);
+        assert_eq!(loaded.settings.hold_ms, 1);
+        assert_eq!(loaded.settings.interval_mean_ms, 1);
+        assert_eq!(loaded.settings.interval_std_ms, 1);
+        assert_eq!(
+            (loaded.settings.jitter_x, loaded.settings.jitter_y),
+            (10_000, 10_000)
+        );
+        assert_eq!(
+            (loaded.settings.max_clicks, loaded.settings.max_seconds),
+            (0, 0)
+        );
+        assert_eq!(loaded.settings.button, MouseButton::Right);
+    }
+
+    #[test]
+    fn partial_and_non_utf8_files_recover_and_backup_failures_do_not_panic() {
+        let dir = Scratch::new();
+        let path = dir.path.join("config.json");
+        for raw in [b"{\"interval_ms\":".as_slice(), b"\xff"] {
+            std::fs::write(&path, raw).unwrap();
+            let loaded = read_at(&path);
+            assert_eq!(loaded.settings, Settings::default());
+            assert!(loaded.error.is_some());
+            assert_eq!(std::fs::read(backup_path(&path)).unwrap(), raw);
+        }
+        std::fs::remove_file(backup_path(&path)).unwrap();
+        std::fs::create_dir(backup_path(&path)).unwrap();
+        let loaded = read_at(&path);
+        assert_eq!(loaded.settings, Settings::default());
+        assert!(loaded.error.unwrap().contains("cannot save backup"));
+    }
+
+    #[test]
+    fn failed_replacement_cleans_up_its_temporary_file() {
+        let dir = Scratch::new();
+        let path = dir.path.join("config.json");
+        std::fs::create_dir(&path).unwrap();
+        assert!(write_at(&path, &Settings::default(), false).is_err());
+        assert!(path.is_dir());
+        assert_eq!(std::fs::read_dir(&dir.path).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saves_and_backups_are_private_and_leave_restore_tokens_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Scratch::new();
+        let path = dir.path.join("config.json");
+        let token = dir.path.join("portal-restore");
+        std::fs::write(&token, "secret").unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for backup in [false, true] {
+            write_at(&path, &Settings::default(), backup).unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(backup_path(&path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&token).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read_to_string(token).unwrap(), "secret");
     }
 }

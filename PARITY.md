@@ -28,7 +28,7 @@ equivalent is named in the note.
 | Always on top | working | working | not possible | `src/ui.rs` |
 | Window icon | working | working | partial | `src/icon.rs`, `src/main.rs`, `src/wayland_icon.rs`, `assets/featherclick.desktop` |
 | Window startup | working | working — checks X11 keyboard libraries after Wayland fallback | working — probes the connection before selecting Wayland | `src/main.rs`, `src/xkb_check.rs` |
-| Saved settings | working | working | working | `src/config.rs` |
+| Saved settings | working — atomic saves with unique temp files, corrupt-file backup and defaults | working — same recovery and value clamping | working — same recovery and value clamping | `src/config.rs` |
 | Headless mode | working | working | partial — desktop session and compositor permission required; pointer reads may require XWayland | `src/cli.rs`, `src/input.rs`, `src/portal.rs`, `src/engine.rs` |
 | Screen coordinates | working | working | not possible | `src/platform.rs` |
 
