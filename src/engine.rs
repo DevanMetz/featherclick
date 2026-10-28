@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 use enigo::Coordinate;
 use enigo::{Button, Direction, Enigo, InputResult, Mouse, Settings as EnigoSettings};
 
@@ -67,7 +67,6 @@ pub enum SessionEvent {
     /// Total clicks sent so far.
     Trigger(u64),
     Captured((i32, i32)),
-    /// A problem that does not end a running session, such as a failed pick.
     Warning(String),
     Stopped(StopReason),
 }
@@ -276,7 +275,13 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
                     continue;
                 }
                 if let Some(handle) = ensure_input(&mut enigo, status) {
-                    run_session(&settings, rx, handle, &mut |event| apply(status, event));
+                    run_session(
+                        &settings,
+                        rx,
+                        handle,
+                        &mut |event| apply(status, event),
+                        &|| false,
+                    );
                 }
             }
         }
@@ -300,24 +305,18 @@ fn apply(status: &Arc<Mutex<Status>>, event: SessionEvent) {
         SessionEvent::Captured(point) => {
             guard.captured = Some(point);
             guard.capture_seq = guard.capture_seq.wrapping_add(1);
-            // A later successful pick retires the previous read failure.
-            guard.error = None;
         }
-        SessionEvent::Warning(message) => guard.error = Some(message),
+        SessionEvent::Warning(err) => guard.error = Some(err),
         SessionEvent::Stopped(reason) => {
             guard.running = false;
             guard.stopped = Some(Instant::now());
-            if let StopReason::Error(message) = &reason {
-                // The pill only has room for "Error"; the banner carries the text.
-                guard.error = Some(message.clone());
-            }
             guard.stop_reason = Some(reason);
         }
     }
 }
 
-fn capture(enigo: &mut Enigo, sink: &mut dyn FnMut(SessionEvent)) {
-    match pointer_location(enigo) {
+fn capture(enigo: &mut impl Pointer, sink: &mut dyn FnMut(SessionEvent)) {
+    match enigo.read_pointer() {
         Ok(point) => sink(SessionEvent::Captured(point)),
         Err(err) => sink(SessionEvent::Warning(err)),
     }
@@ -329,7 +328,11 @@ enum Polled {
     Stop(StopReason),
 }
 
-fn poll(rx: &Receiver<Command>, enigo: &mut Enigo, sink: &mut dyn FnMut(SessionEvent)) -> Polled {
+fn poll(
+    rx: &Receiver<Command>,
+    enigo: &mut impl Pointer,
+    sink: &mut dyn FnMut(SessionEvent),
+) -> Polled {
     loop {
         match rx.try_recv() {
             Err(TryRecvError::Empty) => return Polled::Continue,
@@ -343,24 +346,6 @@ fn poll(rx: &Receiver<Command>, enigo: &mut Enigo, sink: &mut dyn FnMut(SessionE
     }
 }
 
-/// Checks the session limits plus pending commands. Called before every sleep
-/// slice, so a long interval cannot postpone either kind of stop.
-fn stop_check(
-    settings: &Settings,
-    started: Instant,
-    rx: &Receiver<Command>,
-    enigo: &mut Enigo,
-    sink: &mut dyn FnMut(SessionEvent),
-) -> Option<StopReason> {
-    if time_limit_reached(settings, started.elapsed()) {
-        return Some(StopReason::TimeLimit);
-    }
-    match poll(rx, enigo, sink) {
-        Polled::Continue => None,
-        Polled::Stop(reason) => Some(reason),
-    }
-}
-
 fn click_limit_reached(settings: &Settings, clicks: u64) -> bool {
     settings.max_clicks > 0 && clicks >= settings.max_clicks
 }
@@ -369,7 +354,8 @@ fn time_limit_reached(settings: &Settings, elapsed: Duration) -> bool {
     settings.max_seconds > 0 && elapsed >= Duration::from_secs(settings.max_seconds as u64)
 }
 
-/// True when this run moves the pointer itself.
+/// True when this run moves the pointer itself. Stop-on-move then watches the
+/// point we left it on, rather than the position from when the run began.
 fn places_pointer(settings: &Settings) -> bool {
     settings.position == PositionMode::Fixed || settings.jitter != JitterMode::Off
 }
@@ -406,15 +392,6 @@ fn resolve_anchor(
             }
         }
     }
-}
-
-fn anchor_for(settings: &Settings, enigo: &Enigo) -> Result<(i32, i32), String> {
-    let read = if anchor_needs_pointer(settings) {
-        pointer_location(enigo)
-    } else {
-        Ok(settings.point)
-    };
-    resolve_anchor(settings, read)
 }
 
 /// Reads the pointer in the same pixel space a click is aimed at.
@@ -522,78 +499,231 @@ fn place_pointer(enigo: &mut Enigo, x: i32, y: i32) -> Result<(), String> {
     }
 }
 
+pub(crate) trait Pointer: Mouse {
+    fn read_pointer(&self) -> Result<(i32, i32), String>;
+    fn place(&mut self, x: i32, y: i32) -> Result<(), String>;
+}
+
+impl Pointer for Enigo {
+    fn read_pointer(&self) -> Result<(i32, i32), String> {
+        pointer_location(self)
+    }
+    fn place(&mut self, x: i32, y: i32) -> Result<(), String> {
+        place_pointer(self, x, y)
+    }
+}
+
+/// `threshold` of 0 is off. A point sitting on the radius is still inside:
+/// only a strict departure counts, compared in squared pixels so the old
+/// `sqrt as i32` truncation cannot hide one.
+fn moved_away(now: (i32, i32), parked: (i32, i32), threshold: u32) -> bool {
+    if threshold == 0 {
+        return false;
+    }
+    let dx = i128::from(now.0) - i128::from(parked.0);
+    let dy = i128::from(now.1) - i128::from(parked.1);
+    let limit = i128::from(threshold);
+    dx * dx + dy * dy > limit * limit
+}
+
+struct ClickOutcome {
+    presses: u64,
+    /// Set when the trigger itself should end the session (a stop during a
+    /// hold or double-click gap, or a cap met halfway through a double).
+    stop: Option<StopReason>,
+}
+
+/// One clicking session. The [`Waiter`] stays outside so a wait can borrow it
+/// while the abort check borrows the session.
+struct Run<'a, M: Pointer> {
+    settings: &'a Settings,
+    started: Instant,
+    /// Where the pointer is allowed to rest. `None` until we have a reference:
+    /// the anchor when we never move it, the last placed point when we do.
+    parked: Option<(i32, i32)>,
+    rx: &'a Receiver<Command>,
+    enigo: &'a mut M,
+    sink: &'a mut dyn FnMut(SessionEvent),
+    /// Headless Ctrl+C. The GUI passes a closure that is always false; a
+    /// terminal handler would fight the window's own lifetime.
+    interrupt: &'a dyn Fn() -> bool,
+}
+
+impl<M: Pointer> Run<'_, M> {
+    fn finish(&mut self, reason: StopReason) {
+        (self.sink)(SessionEvent::Stopped(reason));
+    }
+
+    /// Limits, pointer movement, pending commands, and a headless interrupt.
+    /// Called on every sleep slice, so none of them waits out the interval.
+    fn stop_check(&mut self) -> Option<StopReason> {
+        if (self.interrupt)() {
+            return Some(StopReason::User);
+        }
+        if time_limit_reached(self.settings, self.started.elapsed()) {
+            return Some(StopReason::TimeLimit);
+        }
+        if let Some(parked) = self.parked {
+            // A failed read is not a move: losing the pointer for one sample
+            // should not end an otherwise healthy run.
+            if let Ok(now) = self.enigo.read_pointer()
+                && moved_away(now, parked, self.settings.stop_on_move_px)
+            {
+                return Some(StopReason::MouseMoved);
+            }
+        }
+        match poll(self.rx, self.enigo, self.sink) {
+            Polled::Continue => None,
+            Polled::Stop(reason) => Some(reason),
+        }
+    }
+
+    fn deliver(
+        &mut self,
+        waiter: &mut Waiter,
+        target: (i32, i32),
+        clicks_so_far: u64,
+    ) -> Result<ClickOutcome, String> {
+        if places_pointer(self.settings) {
+            self.enigo.place(target.0, target.1)?;
+        }
+        let button = Button::from(self.settings.button);
+        match self.settings.style {
+            ClickStyle::Single => {
+                press_release(self.enigo, button).map_err(|err| err.to_string())?;
+                Ok(ClickOutcome {
+                    presses: presses_per_trigger(ClickStyle::Single),
+                    stop: None,
+                })
+            }
+            ClickStyle::Hold => {
+                self.enigo
+                    .button(button, Direction::Press)
+                    .map_err(|err| err.to_string())?;
+                let deadline =
+                    Instant::now() + Duration::from_millis(u64::from(self.settings.hold_ms));
+                let stop = waiter.wait(deadline, &mut || self.stop_check());
+                // Every path after a successful press releases, including a
+                // stop that arrived during the hold.
+                release_button(self.enigo, button).map_err(|err| err.to_string())?;
+                Ok(ClickOutcome {
+                    presses: presses_per_trigger(ClickStyle::Hold),
+                    stop,
+                })
+            }
+            ClickStyle::Double => {
+                press_release(self.enigo, button).map_err(|err| err.to_string())?;
+                // The second press is its own click. Skip it when the cap is
+                // already met, or when a stop arrives in the gap.
+                if click_limit_reached(self.settings, clicks_so_far + 1) {
+                    return Ok(ClickOutcome {
+                        presses: 1,
+                        stop: Some(StopReason::ClickLimit),
+                    });
+                }
+                let gap = Instant::now() + DOUBLE_GAP;
+                if let Some(stop) = waiter.wait(gap, &mut || self.stop_check()) {
+                    return Ok(ClickOutcome {
+                        presses: 1,
+                        stop: Some(stop),
+                    });
+                }
+                press_release(self.enigo, button).map_err(|err| err.to_string())?;
+                Ok(ClickOutcome {
+                    presses: presses_per_trigger(ClickStyle::Double),
+                    stop: None,
+                })
+            }
+        }
+    }
+}
+
 /// Runs one clicking session to completion. Blocks until a limit is hit or a
 /// stop command arrives.
 pub(crate) fn run_session(
     settings: &Settings,
     rx: &Receiver<Command>,
-    enigo: &mut Enigo,
+    enigo: &mut impl Pointer,
     sink: &mut dyn FnMut(SessionEvent),
+    interrupt: &dyn Fn() -> bool,
 ) {
     let _timer = crate::platform::TimerResolution::acquire();
     sink(SessionEvent::Started);
 
     let started = Instant::now();
-    let mut clicks: u64 = 0;
-    let mut reason: Option<StopReason> = None;
     let mut waiter = Waiter::new();
+    let mut run = Run {
+        settings,
+        started,
+        parked: None,
+        rx,
+        enigo,
+        sink,
+        interrupt,
+    };
 
-    // Give the user time to move the pointer into place before the anchor is taken.
+    // Give the user time to move the pointer into place before the anchor is
+    // taken. Movement during the delay is positioning, not a stop.
     if settings.start_delay_ms > 0 {
-        let deadline = started + Duration::from_millis(settings.start_delay_ms as u64);
-        if let Some(stopped) = waiter.wait(deadline, &mut || {
-            stop_check(settings, started, rx, enigo, sink)
-        }) {
-            reason = Some(stopped);
+        let deadline = started + Duration::from_millis(u64::from(settings.start_delay_ms));
+        if let Some(stopped) = waiter.wait(deadline, &mut || run.stop_check()) {
+            run.finish(stopped);
+            return;
         }
     }
 
-    // Where jitter is measured from: captured once, so repeated clicks never
-    // drift away from the intended spot. A run that needs the pointer and
-    // cannot read it stops here, before a guess at (0, 0) moves it.
-    let mut anchor = settings.point;
-    if reason.is_none() {
-        match anchor_for(settings, enigo) {
-            Ok(point) => anchor = point,
-            Err(err) => reason = Some(StopReason::Error(err)),
+    let read = if anchor_needs_pointer(settings) {
+        run.enigo.read_pointer()
+    } else {
+        Ok(settings.point)
+    };
+    let anchor = match resolve_anchor(settings, read) {
+        Ok(point) => point,
+        Err(err) => {
+            run.finish(StopReason::Error(err));
+            return;
         }
+    };
+    if settings.stop_on_move_px > 0 && !places_pointer(settings) {
+        run.parked = Some(anchor);
     }
 
+    let mut clicks: u64 = 0;
     let mut next = Instant::now();
-    while reason.is_none() {
-        if click_limit_reached(settings, clicks) {
-            reason = Some(StopReason::ClickLimit);
-            break;
-        }
-        if time_limit_reached(settings, started.elapsed()) {
-            reason = Some(StopReason::TimeLimit);
-            break;
+    loop {
+        // A wait that wakes after its deadline does not look one last time.
+        // Catch a move or a stop here, before the next click goes out.
+        if let Some(stopped) = run.stop_check() {
+            run.finish(stopped);
+            return;
         }
 
         let target = target_point(settings, anchor);
-        if let Err(err) = perform_click(enigo, settings, target) {
-            reason = Some(StopReason::Error(err));
-            break;
-        }
-        clicks += presses_per_trigger(settings.style);
-        sink(SessionEvent::Trigger(clicks));
+        let outcome = match run.deliver(&mut waiter, target, clicks) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                run.finish(StopReason::Error(err.to_string()));
+                return;
+            }
+        };
+        clicks += outcome.presses;
+        (run.sink)(SessionEvent::Trigger(clicks));
 
+        // Park on the point we just requested. Our own move is not the user
+        // taking the mouse; cursor mode keeps the anchor captured above.
+        if places_pointer(settings) && settings.stop_on_move_px > 0 {
+            run.parked = Some(target);
+        }
+
+        if let Some(stopped) = outcome.stop {
+            run.finish(stopped);
+            return;
+        }
         // Do not sleep a whole interval after the final click just to notice
         // that the cap was reached.
         if click_limit_reached(settings, clicks) {
-            reason = Some(StopReason::ClickLimit);
-            break;
-        }
-
-        if settings.stop_on_move_px > 0
-            && let Ok(now) = pointer_location(enigo)
-            && distance(now, target) > settings.stop_on_move_px as i32
-        {
-            // A failed read is not a move: one missed sample should not end
-            // the run. The anchor step already refused to start when the
-            // pointer cannot be read at all.
-            reason = Some(StopReason::MouseMoved);
-            break;
+            run.finish(StopReason::ClickLimit);
+            return;
         }
 
         next += interval(settings);
@@ -603,16 +733,11 @@ pub(crate) fn run_session(
             // than firing a burst to catch up.
             next = now;
         }
-        if let Some(stopped) =
-            waiter.wait(next, &mut || stop_check(settings, started, rx, enigo, sink))
-        {
-            reason = Some(stopped);
+        if let Some(stopped) = waiter.wait(next, &mut || run.stop_check()) {
+            run.finish(stopped);
+            return;
         }
     }
-
-    sink(SessionEvent::Stopped(
-        reason.unwrap_or(StopReason::Shutdown),
-    ));
 }
 
 fn presses_per_trigger(style: ClickStyle) -> u64 {
@@ -620,12 +745,6 @@ fn presses_per_trigger(style: ClickStyle) -> u64 {
         ClickStyle::Double => 2,
         ClickStyle::Single | ClickStyle::Hold => 1,
     }
-}
-
-fn distance(a: (i32, i32), b: (i32, i32)) -> i32 {
-    let dx = (a.0 - b.0) as i64;
-    let dy = (a.1 - b.1) as i64;
-    ((dx * dx + dy * dy) as f64).sqrt() as i32
 }
 
 impl From<MouseButton> for Button {
@@ -638,35 +757,17 @@ impl From<MouseButton> for Button {
     }
 }
 
-/// Moves (when needed) and clicks. Kept panic-free: the pointer is only ever
-/// left pressed for the duration of this call.
-fn perform_click(enigo: &mut Enigo, settings: &Settings, target: (i32, i32)) -> Result<(), String> {
-    if places_pointer(settings) {
-        place_pointer(enigo, target.0, target.1)?;
+/// Retries once. A duplicate release is harmless; a stuck button is not.
+fn release_button(enigo: &mut impl Mouse, button: Button) -> InputResult<()> {
+    if enigo.button(button, Direction::Release).is_err() {
+        return enigo.button(button, Direction::Release);
     }
-    let button = Button::from(settings.button);
-    match settings.style {
-        ClickStyle::Single => press_release(enigo, button).map_err(|err| err.to_string()),
-        ClickStyle::Hold => {
-            enigo
-                .button(button, Direction::Press)
-                .map_err(|err| err.to_string())?;
-            thread::sleep(Duration::from_millis(settings.hold_ms as u64));
-            enigo
-                .button(button, Direction::Release)
-                .map_err(|err| err.to_string())
-        }
-        ClickStyle::Double => {
-            press_release(enigo, button).map_err(|err| err.to_string())?;
-            thread::sleep(DOUBLE_GAP);
-            press_release(enigo, button).map_err(|err| err.to_string())
-        }
-    }
+    Ok(())
 }
 
-fn press_release(enigo: &mut Enigo, button: Button) -> InputResult<()> {
+fn press_release(enigo: &mut impl Mouse, button: Button) -> InputResult<()> {
     enigo.button(button, Direction::Press)?;
-    enigo.button(button, Direction::Release)
+    release_button(enigo, button)
 }
 
 /// Draws the click interval for one trigger.
@@ -690,7 +791,7 @@ pub fn interval(settings: &Settings) -> Duration {
             if sigma <= 0.0 {
                 mean
             } else {
-                (mean + sigma * gaussian()).clamp(1.0, mean + 4.0 * sigma)
+                clamp_normal(mean, sigma, gaussian())
             }
         }
     };
@@ -740,6 +841,16 @@ pub fn target_point(settings: &Settings, anchor: (i32, i32)) -> (i32, i32) {
 
 fn clamp_sigma(value: f64) -> f64 {
     value.clamp(-3.0, 3.0)
+}
+
+/// One Gaussian draw, in milliseconds, kept inside ±4 sigma and at least 1.
+///
+/// Clamping only the top used to leave the bottom at 1 ms, so a draw could
+/// land far below `mean - 4 sigma`.
+fn clamp_normal(mean: f64, sigma: f64, z: f64) -> f64 {
+    let low = (mean - 4.0 * sigma).max(1.0);
+    let high = (mean + 4.0 * sigma).max(low);
+    (mean + sigma * z).clamp(low, high)
 }
 
 /// Standard normal sample (Box-Muller).
@@ -797,8 +908,12 @@ impl Waiter {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
+    use enigo::{Axis, InputError, Mouse};
+
     use super::*;
-    use crate::config::{JitterMode, TimingMode};
+    use crate::config::{JitterMode, PositionMode, TimingMode};
 
     fn settings() -> Settings {
         let mut s = Settings::default();
@@ -841,6 +956,43 @@ mod tests {
             assert!(secs >= 0.001, "{secs}s would spin the loop");
             assert!(secs <= 0.040, "{secs}s is beyond the +4 sigma clamp");
         }
+    }
+
+    #[test]
+    fn normal_timing_clamps_both_sides_of_the_four_sigma_window() {
+        // mean 100, sigma 10: the window is 60..=140, not 1..=140.
+        assert_eq!(clamp_normal(100.0, 10.0, 0.0), 100.0);
+        assert_eq!(clamp_normal(100.0, 10.0, -4.0), 60.0);
+        assert_eq!(clamp_normal(100.0, 10.0, 4.0), 140.0);
+        assert_eq!(
+            clamp_normal(100.0, 10.0, -100.0),
+            60.0,
+            "a deep tail must stop at mean - 4 sigma, not at 1 ms"
+        );
+        assert_eq!(clamp_normal(100.0, 10.0, 100.0), 140.0);
+        // Four sigma below this mean crosses 1 ms, so the floor applies.
+        assert_eq!(clamp_normal(100.0, 25.0, -100.0), 1.0);
+        assert_eq!(clamp_normal(100.0, 25.0, 100.0), 200.0);
+
+        let mut s = settings();
+        s.timing = TimingMode::Normal;
+        s.interval_mean_ms = 100;
+        s.interval_std_ms = 10;
+        let mut below_mean = false;
+        let mut above_mean = false;
+        for _ in 0..20_000 {
+            let ms = interval(&s).as_secs_f64() * 1000.0;
+            assert!(
+                (60.0 - 1e-6..=140.0 + 1e-6).contains(&ms),
+                "{ms} ms is outside mean ± 4 sigma"
+            );
+            below_mean |= ms < 90.0;
+            above_mean |= ms > 110.0;
+        }
+        assert!(
+            below_mean && above_mean,
+            "sigma of 10 ms should spread around the mean"
+        );
     }
 
     #[test]
@@ -975,6 +1127,415 @@ mod tests {
         );
     }
 
+    #[test]
+    fn moved_away_is_strict_and_zero_means_off() {
+        let home = (10, -20);
+        assert!(!moved_away(home, home, 5));
+        // 3-4-5 triangle: exactly the threshold stays inside.
+        assert!(!moved_away((13, -16), home, 5));
+        assert!(moved_away((13, -15), home, 5));
+        assert!(!moved_away((1_000, 1_000), home, 0));
+    }
+
+    /// Pointer whose reported position can change under the session, without a
+    /// display. `location` counts reads so a test can move the pointer on a
+    /// later sample than the one taken immediately after a click.
+    struct FakePointer {
+        inner: RefCell<FakeState>,
+    }
+
+    struct FakeState {
+        pos: (i32, i32),
+        locations: u32,
+        /// Report `jump` once `locations` exceeds this.
+        jump_after: Option<u32>,
+        jump: (i32, i32),
+        fail_location: bool,
+        log: Vec<FakeEvent>,
+        down: Vec<Button>,
+        stop_on_press: Option<Sender<Command>>,
+        stop_sent: bool,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum FakeEvent {
+        Move((i32, i32)),
+        Press,
+        Release,
+    }
+
+    impl FakePointer {
+        fn at(pos: (i32, i32)) -> Self {
+            Self {
+                inner: RefCell::new(FakeState {
+                    pos,
+                    locations: 0,
+                    jump_after: None,
+                    jump: pos,
+                    fail_location: false,
+                    log: Vec::new(),
+                    down: Vec::new(),
+                    stop_on_press: None,
+                    stop_sent: false,
+                }),
+            }
+        }
+
+        fn presses(&self) -> usize {
+            self.inner
+                .borrow()
+                .log
+                .iter()
+                .filter(|event| matches!(event, FakeEvent::Press))
+                .count()
+        }
+
+        fn releases(&self) -> usize {
+            self.inner
+                .borrow()
+                .log
+                .iter()
+                .filter(|event| matches!(event, FakeEvent::Release))
+                .count()
+        }
+
+        fn moves(&self) -> usize {
+            self.inner
+                .borrow()
+                .log
+                .iter()
+                .filter(|event| matches!(event, FakeEvent::Move(_)))
+                .count()
+        }
+
+        fn locations(&self) -> u32 {
+            self.inner.borrow().locations
+        }
+    }
+
+    impl Mouse for FakePointer {
+        fn button(&mut self, button: Button, direction: Direction) -> InputResult<()> {
+            let mut inner = self.inner.borrow_mut();
+            match direction {
+                Direction::Press => {
+                    inner.down.push(button);
+                    inner.log.push(FakeEvent::Press);
+                    if !inner.stop_sent
+                        && let Some(tx) = &inner.stop_on_press
+                    {
+                        let _ = tx.send(Command::Stop);
+                        inner.stop_sent = true;
+                    }
+                }
+                Direction::Release => {
+                    if let Some(index) = inner.down.iter().rposition(|held| *held == button) {
+                        inner.down.remove(index);
+                    }
+                    inner.log.push(FakeEvent::Release);
+                }
+                Direction::Click => {
+                    inner.log.push(FakeEvent::Press);
+                    inner.log.push(FakeEvent::Release);
+                }
+            }
+            Ok(())
+        }
+
+        fn move_mouse(&mut self, x: i32, y: i32, coordinate: Coordinate) -> InputResult<()> {
+            let mut inner = self.inner.borrow_mut();
+            let pos = match coordinate {
+                Coordinate::Abs => (x, y),
+                Coordinate::Rel => (inner.pos.0 + x, inner.pos.1 + y),
+            };
+            inner.pos = pos;
+            inner.log.push(FakeEvent::Move(pos));
+            Ok(())
+        }
+
+        fn scroll(&mut self, _length: i32, _axis: Axis) -> InputResult<()> {
+            Ok(())
+        }
+
+        fn main_display(&self) -> InputResult<(i32, i32)> {
+            Ok((1920, 1080))
+        }
+
+        fn location(&self) -> InputResult<(i32, i32)> {
+            let mut inner = self.inner.borrow_mut();
+            if inner.fail_location && inner.locations > 0 {
+                return Err(InputError::Simulate("no pointer"));
+            }
+            inner.locations += 1;
+            if inner
+                .jump_after
+                .is_some_and(|after| inner.locations > after)
+            {
+                return Ok(inner.jump);
+            }
+            Ok(inner.pos)
+        }
+    }
+
+    impl Pointer for FakePointer {
+        fn read_pointer(&self) -> Result<(i32, i32), String> {
+            self.location().map_err(|err| err.to_string())
+        }
+        fn place(&mut self, x: i32, y: i32) -> Result<(), String> {
+            self.move_mouse(x, y, Coordinate::Abs)
+                .map_err(|err| err.to_string())
+        }
+    }
+
+    fn drive(
+        settings: &Settings,
+        mouse: &mut FakePointer,
+        rx: &Receiver<Command>,
+        interrupt: &dyn Fn() -> bool,
+    ) -> (Vec<SessionEvent>, Duration) {
+        let mut events = Vec::new();
+        let started = Instant::now();
+        run_session(
+            settings,
+            rx,
+            mouse,
+            &mut |event| events.push(event),
+            interrupt,
+        );
+        (events, started.elapsed())
+    }
+
+    fn stop_reason(events: &[SessionEvent]) -> StopReason {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                SessionEvent::Stopped(reason) => Some(reason.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("session did not stop: {events:?}"))
+    }
+
+    fn triggers(events: &[SessionEvent]) -> Vec<u64> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Trigger(n) => Some(*n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_buttons_released(mouse: &FakePointer) {
+        assert_eq!(
+            mouse.presses(),
+            mouse.releases(),
+            "a press was left down: {:?}",
+            mouse.inner.borrow().log
+        );
+        assert!(mouse.inner.borrow().down.is_empty(), "button still held");
+    }
+
+    fn armed(interval_ms: u32, clicks: u64) -> Settings {
+        let mut s = settings();
+        s.timing = TimingMode::Fixed;
+        s.interval_ms = interval_ms;
+        s.max_clicks = clicks;
+        s.max_seconds = 0;
+        s.stop_on_move_px = 0;
+        s.position = PositionMode::Fixed;
+        s.point = (40, 40);
+        s.jitter = JitterMode::Off;
+        s
+    }
+
+    #[test]
+    fn stop_on_move_notices_a_fixed_target_left_during_the_interval() {
+        let mut s = armed(2_000, 20);
+        s.stop_on_move_px = 8;
+        let mut mouse = FakePointer::at((40, 40));
+        {
+            let mut inner = mouse.inner.borrow_mut();
+            // The sample taken as the wait starts still sees the placed point.
+            // The next sample, during the interval, sees the user leave.
+            inner.jump_after = Some(1);
+            inner.jump = (40, 80);
+        }
+        let (tx, rx) = channel();
+        let (events, elapsed) = drive(&s, &mut mouse, &rx, &|| false);
+        drop(tx);
+
+        assert_eq!(stop_reason(&events), StopReason::MouseMoved);
+        assert_eq!(triggers(&events), vec![1]);
+        assert_eq!(
+            mouse.presses(),
+            1,
+            "must not click again after the pointer leaves"
+        );
+        assert!(mouse.moves() >= 1);
+        assert!(
+            mouse.locations() >= 2,
+            "the departure has to show up on a later sample, not the first"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "stop-on-move waited out the 2s interval: {elapsed:?}"
+        );
+        assert_buttons_released(&mouse);
+    }
+
+    #[test]
+    fn stop_on_move_watches_the_anchor_when_the_pointer_is_not_placed() {
+        let mut s = armed(2_000, 20);
+        s.position = PositionMode::Cursor;
+        s.stop_on_move_px = 5;
+        let mut mouse = FakePointer::at((10, 10));
+        {
+            let mut inner = mouse.inner.borrow_mut();
+            // Read 1 is the anchor, read 2 is the pre-click check, read 3 is
+            // the first sample of the interval.
+            inner.jump_after = Some(2);
+            inner.jump = (80, 10);
+        }
+        let (tx, rx) = channel();
+        let (events, elapsed) = drive(&s, &mut mouse, &rx, &|| false);
+        drop(tx);
+
+        assert_eq!(stop_reason(&events), StopReason::MouseMoved);
+        assert_eq!(mouse.presses(), 1);
+        assert_eq!(mouse.moves(), 0, "cursor mode must not move the pointer");
+        assert!(mouse.locations() >= 3);
+        assert!(elapsed < Duration::from_millis(1_500), "{elapsed:?}");
+        assert_buttons_released(&mouse);
+    }
+
+    #[test]
+    fn placing_the_pointer_is_not_treated_as_the_user_moving_it() {
+        let mut s = armed(5, 3);
+        s.stop_on_move_px = 1;
+        // Start elsewhere so the session's own move is a real relocation.
+        let mut mouse = FakePointer::at((0, 0));
+        let (tx, rx) = channel();
+        let (events, _) = drive(&s, &mut mouse, &rx, &|| false);
+        drop(tx);
+
+        assert_eq!(stop_reason(&events), StopReason::ClickLimit);
+        assert_eq!(triggers(&events), vec![1, 2, 3]);
+        assert_eq!(mouse.presses(), 3);
+        assert_buttons_released(&mouse);
+    }
+
+    #[test]
+    fn stop_on_move_off_ignores_a_jump_and_a_failed_read_is_not_a_move() {
+        let mut s = armed(5, 2);
+        s.stop_on_move_px = 0;
+        let mut mouse = FakePointer::at((40, 40));
+        mouse.inner.borrow_mut().jump_after = Some(0);
+        mouse.inner.borrow_mut().jump = (400, 400);
+        let (tx, rx) = channel();
+        let (events, _) = drive(&s, &mut mouse, &rx, &|| false);
+        drop(tx);
+        assert_eq!(stop_reason(&events), StopReason::ClickLimit);
+        assert_eq!(mouse.presses(), 2);
+
+        let mut s = armed(5, 2);
+        s.stop_on_move_px = 5;
+        let mut mouse = FakePointer::at((40, 40));
+        mouse.inner.borrow_mut().fail_location = true;
+        let (tx, rx) = channel();
+        let (events, _) = drive(&s, &mut mouse, &rx, &|| false);
+        drop(tx);
+        assert_eq!(stop_reason(&events), StopReason::ClickLimit);
+        assert_eq!(mouse.presses(), 2);
+        assert_buttons_released(&mouse);
+    }
+
+    #[test]
+    fn a_stop_during_a_hold_releases_the_button_without_waiting_it_out() {
+        let mut s = armed(100, 5);
+        s.style = ClickStyle::Hold;
+        s.hold_ms = 5_000;
+        s.position = PositionMode::Cursor;
+        let (tx, rx) = channel();
+        let mut mouse = FakePointer::at((1, 1));
+        mouse.inner.borrow_mut().stop_on_press = Some(tx);
+        let (events, elapsed) = drive(&s, &mut mouse, &rx, &|| false);
+
+        assert_eq!(stop_reason(&events), StopReason::User);
+        assert_eq!(triggers(&events), vec![1]);
+        assert_eq!(mouse.presses(), 1);
+        assert_buttons_released(&mouse);
+        assert!(
+            elapsed < Duration::from_millis(1_000),
+            "hold ran on after the stop: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_double_click_does_not_send_the_second_press_past_a_stop_or_the_cap() {
+        let mut s = armed(100, 10);
+        s.style = ClickStyle::Double;
+        s.position = PositionMode::Cursor;
+        let (tx, rx) = channel();
+        let mut mouse = FakePointer::at((1, 1));
+        mouse.inner.borrow_mut().stop_on_press = Some(tx);
+        let (events, elapsed) = drive(&s, &mut mouse, &rx, &|| false);
+        assert_eq!(stop_reason(&events), StopReason::User);
+        assert_eq!(triggers(&events), vec![1]);
+        assert_eq!(mouse.presses(), 1);
+        assert_buttons_released(&mouse);
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+
+        let mut s = armed(50, 1);
+        s.style = ClickStyle::Double;
+        s.position = PositionMode::Cursor;
+        let (tx, rx) = channel();
+        let mut mouse = FakePointer::at((1, 1));
+        let (events, _) = drive(&s, &mut mouse, &rx, &|| false);
+        drop(tx);
+        assert_eq!(stop_reason(&events), StopReason::ClickLimit);
+        assert_eq!(triggers(&events), vec![1], "an odd cap must not overshoot");
+        assert_eq!(mouse.presses(), 1);
+        assert_buttons_released(&mouse);
+
+        let mut s = armed(50, 2);
+        s.style = ClickStyle::Double;
+        s.position = PositionMode::Cursor;
+        let (tx, rx) = channel();
+        let mut mouse = FakePointer::at((1, 1));
+        let (events, _) = drive(&s, &mut mouse, &rx, &|| false);
+        drop(tx);
+        assert_eq!(stop_reason(&events), StopReason::ClickLimit);
+        assert_eq!(triggers(&events), vec![2]);
+        assert_eq!(mouse.presses(), 2);
+        assert_buttons_released(&mouse);
+    }
+
+    #[test]
+    fn a_pending_stop_or_interrupt_cancels_before_the_next_click() {
+        let s = armed(2_000, 10);
+        let (tx, rx) = channel();
+        tx.send(Command::Stop).unwrap();
+        let mut mouse = FakePointer::at((40, 40));
+        let (events, elapsed) = drive(&s, &mut mouse, &rx, &|| false);
+        drop(tx);
+        assert_eq!(stop_reason(&events), StopReason::User);
+        assert_eq!(mouse.presses(), 0);
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+
+        let mut s = armed(100, 10);
+        s.start_delay_ms = 5_000;
+        let (tx, rx) = channel();
+        let mut mouse = FakePointer::at((40, 40));
+        let (events, elapsed) = drive(&s, &mut mouse, &rx, &|| true);
+        drop(tx);
+        assert_eq!(stop_reason(&events), StopReason::User);
+        assert!(triggers(&events).is_empty());
+        assert_eq!(mouse.presses(), 0);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "interrupt waited out the start delay: {elapsed:?}"
+        );
+    }
     #[test]
     fn each_connection_attempt_opens_at_most_one_server() {
         let wayland = backend_attempts(true);

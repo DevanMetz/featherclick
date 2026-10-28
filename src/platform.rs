@@ -1,5 +1,14 @@
 //! Platform shims that are too small to justify a dependency.
 
+use std::sync::Once;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// How many times headless Ctrl+C / SIGINT has been delivered.
+///
+/// The handler only touches this atomic: a signal handler must not lock or
+/// allocate. The session polls it from the click loop.
+static INTERRUPTS: AtomicU8 = AtomicU8::new(0);
+
 /// Reattaches stdout/stderr to the launching console.
 ///
 /// Release Windows builds use the GUI subsystem so double-clicking the exe does
@@ -122,3 +131,62 @@ pub(crate) fn set_cursor_pos(x: i32, y: i32) -> Result<(), String> {
         ))
     }
 }
+/// Arranges for the first Ctrl+C to ask the headless session to stop, and for
+/// a second one to terminate the process. Installed only for `--headless`:
+/// the windowed process should keep the default handler so a terminal Ctrl+C
+/// still quits it.
+pub fn arm_headless_interrupt() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(install_interrupt_handler);
+}
+
+/// `true` after the first headless Ctrl+C, until the process exits.
+pub fn interrupt_requested() -> bool {
+    INTERRUPTS.load(Ordering::SeqCst) > 0
+}
+
+#[cfg(unix)]
+fn install_interrupt_handler() {
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_sigint as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+/// First delivery sets the flag. A second restores the default action and
+/// re-raises, which is async-signal-safe and exits with the usual status.
+#[cfg(unix)]
+unsafe extern "C" fn handle_sigint(_signal: libc::c_int) {
+    if INTERRUPTS.fetch_add(1, Ordering::SeqCst) > 0 {
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::raise(libc::SIGINT);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn install_interrupt_handler() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    unsafe {
+        SetConsoleCtrlHandler(Some(handle_console), 1);
+    }
+}
+
+/// Console-control callback. Returning 1 marks the event handled; returning 0
+/// lets Windows terminate the process, which is what a second Ctrl+C wants.
+#[cfg(windows)]
+unsafe extern "system" fn handle_console(ctrl: u32) -> i32 {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+    if (ctrl == CTRL_C_EVENT || ctrl == CTRL_BREAK_EVENT)
+        && INTERRUPTS.fetch_add(1, Ordering::SeqCst) == 0
+    {
+        return 1;
+    }
+    0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn install_interrupt_handler() {}
