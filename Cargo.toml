@@ -21,8 +21,9 @@ serde_json = "1.0.151"
 libc = "0.2.189"
 
 [target."cfg(target_os = \"linux\")".dependencies]
-# X11 (x11rb, on by default) plus wlroots' virtual-pointer protocol, which is
-# what Sway and Hyprland expose to native Wayland clients.
+# X11 (x11rb, on by default) is enigo's fallback. On Wayland, FeatherClick
+# speaks wlroots' virtual-pointer protocol itself so a click can be aimed
+# across the whole layout; these crates are the same ones enigo already uses.
 #
 # enigo's libei backend (GNOME/KDE's RemoteDesktop portal) is deliberately NOT
 # enabled: its portal client unwraps the connection result, so it aborts the
@@ -30,14 +31,11 @@ libc = "0.2.189"
 # containers and minimal window managers included. Crashing on launch is worse
 # than a documented limitation.
 enigo = { version = "0.6.1", features = ["wayland"] }
-# winit's set_window_icon is a no-op on Wayland. These are the same crates
-# eframe already builds; they are named here so the window icon can be set on
-# winit's wl_display with xdg-toplevel-icon-v1.
-libc = "0.2"
 raw-window-handle = "0.6"
 wayland-backend = { version = "0.3.17", features = ["client_system"] }
 wayland-client = "0.31.15"
-wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+wayland-protocols = { version = "0.32.13", features = ["client", "unstable", "staging"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland"] }
 
 [target."cfg(windows)".dependencies]

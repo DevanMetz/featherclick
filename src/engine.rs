@@ -254,6 +254,7 @@ struct BackendAttempt {
 /// Wayland alone, and only when `WAYLAND_DISPLAY` is set; the last is X11
 /// alone, which is also the path on Windows and macOS (those fields are
 /// ignored there).
+#[cfg(test)]
 fn backend_attempts(wayland_is_set: bool) -> Vec<BackendAttempt> {
     let mut attempts = Vec::new();
     if wayland_is_set {
@@ -281,29 +282,17 @@ fn enigo_settings(attempt: &BackendAttempt) -> EnigoSettings {
 }
 
 /// Connects to one platform input backend.
-pub fn connect() -> Result<Enigo, String> {
-    #[cfg(target_os = "linux")]
-    let wayland_is_set = std::env::var_os("WAYLAND_DISPLAY").is_some();
-    #[cfg(not(target_os = "linux"))]
-    let wayland_is_set = false;
-
-    let mut last_err = String::from("no display");
-    for attempt in backend_attempts(wayland_is_set) {
-        match Enigo::new(&enigo_settings(&attempt)) {
-            Ok(enigo) => return Ok(enigo),
-            Err(err) => last_err = err.to_string(),
-        }
-    }
-    Err(format!("cannot simulate input: {last_err}"))
+pub fn connect() -> Result<crate::input::Input, String> {
+    crate::input::connect()
 }
 
 /// Opens the input backend if a previous attempt failed. One connection
 /// attempt per call: the error from that attempt is what the UI shows.
 fn ensure_input<'a>(
-    enigo: &'a mut Option<Enigo>,
+    enigo: &'a mut Option<crate::input::Input>,
     status: &Arc<Mutex<Status>>,
     wake: &(dyn Fn() + Send + Sync),
-) -> Option<&'a mut Enigo> {
+) -> Option<&'a mut crate::input::Input> {
     if enigo.is_none() {
         match connect() {
             Ok(handle) => *enigo = Some(handle),
@@ -520,7 +509,7 @@ fn location_fallback(primary: String) -> Result<(i32, i32), String> {
 
 fn explain_location(primary: &str, x11: Option<&str>) -> String {
     #[cfg(target_os = "linux")]
-    if primary.contains("Not implemented") {
+    if primary.contains("Not implemented") || primary.contains("does not report a position") {
         return match x11 {
             None => "cannot read the pointer position: Wayland does not report it, and no X11 display is connected".to_string(),
             Some(err) => format!(
@@ -608,6 +597,22 @@ impl Pointer for Enigo {
     }
     fn place(&mut self, x: i32, y: i32) -> Result<(), String> {
         place_pointer(self, x, y)
+    }
+}
+
+impl Pointer for crate::input::Input {
+    fn read_pointer(&self) -> Result<(i32, i32), String> {
+        self.location().or_else(location_fallback)
+    }
+    fn place(&mut self, x: i32, y: i32) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            crate::platform::set_cursor_pos(x, y)
+        }
+        #[cfg(not(windows))]
+        {
+            self.move_abs(x, y)
+        }
     }
 }
 
@@ -2177,8 +2182,8 @@ mod tests {
     fn pointer_placement_round_trips_on_x11() {
         let mut enigo = connect().expect("Xvfb should accept an X11 connection");
         let target = (80, 60);
-        place_pointer(&mut enigo, target.0, target.1).expect("X11 move");
-        let seen = pointer_location(&enigo).expect("X11 read");
+        enigo.place(target.0, target.1).expect("X11 move");
+        let seen = enigo.read_pointer().expect("X11 read");
         assert_eq!(
             seen, target,
             "the click connection did not land on the requested pixel"

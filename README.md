@@ -68,7 +68,9 @@ install -Dm644 featherclick.png ~/.local/share/icons/hicolor/256x256/apps/feathe
 | Picking a position | ✅ | ✅ | ✅ | ✅ via XWayland |
 
 On Wayland, clicking uses the compositor's virtual-pointer protocol, which
-wlroots-based compositors (Sway, Hyprland) provide. GNOME and KDE are not
+wlroots-based compositors (Sway, Hyprland) provide. Fixed points map across
+the entire xdg-output logical layout, including monitors left of or above the
+origin and fractional scaling. GNOME and KDE are not
 covered: their only input path is the RemoteDesktop portal, and the upstream
 portal client aborts the process when no portal is present, so it is
 deliberately not compiled in — a crash on launch is worse than a documented
@@ -145,10 +147,9 @@ Exit status is `0` for a normal stop — including limits and Ctrl+C — `1` if 
 input backend could not be reached or failed during a run, and `2` for invalid
 arguments. A second Ctrl+C exits immediately.
 
-Coordinates are physical screen pixels, measured from the top-left of the
-primary display, including other monitors. A display to the left or above
-the primary has negative coordinates. Windows and X11 accept those. On
-Wayland's virtual pointer a negative point is an error.
+Coordinates are physical screen pixels on Windows and X11. On Wayland they
+are points in the compositor’s logical layout. Monitors left of or above the
+origin can have negative coordinates.
 
 ## Configuration
 

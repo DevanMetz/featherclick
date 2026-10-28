@@ -10,10 +10,15 @@ mod config;
 mod engine;
 mod hotkeys;
 mod icon;
+mod input;
 mod platform;
+mod pointer_layout;
 mod ui;
 #[cfg(target_os = "linux")]
 mod wayland_icon;
+
+#[cfg(target_os = "linux")]
+mod wayland_pointer;
 
 use std::process::ExitCode;
 

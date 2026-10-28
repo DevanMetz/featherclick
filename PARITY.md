@@ -37,20 +37,20 @@ Wayland clicks go through wlroots' virtual pointer (Sway, Hyprland). GNOME and
 KDE do not offer that protocol. enigo's libei portal client is not compiled
 in: it aborts when `org.freedesktop.portal.Desktop` is absent (`Cargo.toml`).
 
-On a session where both an X11 display and a Wayland socket are reachable,
-enigo opens both and sends each button and each move to both.
+When both X11 and Wayland are available, clicks use only the virtual pointer;
+a separate X11 connection can read the pointer position.
 
-A fixed Wayland point uses the first output's size only, and a negative
-coordinate is rejected. Jitter, hold, and double click share that path, so
-they are partial on Wayland for the same reason. Headless mode uses the same
-engine.
+A fixed Wayland point maps across the entire xdg-output logical layout,
+including negative coordinates and fractional scaling. The virtual pointer is
+unbound and is the only connection used for clicks. The mapping is unit-tested;
+it has not been tested on a live Wayland compositor. Jitter, hold, double click,
+and headless mode use the same engine.
 
 ## Pointer location
 
-enigo's Wayland backend does not implement `location()`. The Linux backend
-asks Wayland first and does not fall through to X11, so on a Wayland
-connection Pick does not update the point, cursor mode keeps the saved point,
-and stop-on-move never sees movement. X11 reads the pointer.
+The Wayland virtual pointer does not report its position. An X11-only connection
+reads it when available; otherwise Pick, cursor jitter, and stop-on-move report
+that the position is unavailable. X11 reads the pointer directly.
 
 The stop-on-move check itself runs after each click on every platform.
 

@@ -775,6 +775,7 @@ dependencies = [
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
+ "wayland-protocols-wlr",
  "windows-sys 0.61.2",
  "winit",
  "winresource",
