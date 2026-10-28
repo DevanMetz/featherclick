@@ -769,9 +769,14 @@ dependencies = [
  "global-hotkey",
  "libc",
  "rand",
+ "raw-window-handle",
  "serde",
  "serde_json",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
  "windows-sys 0.61.2",
+ "winit",
  "winresource",
 ]
 
