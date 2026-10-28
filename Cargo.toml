@@ -17,6 +17,9 @@ rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 
+[target."cfg(unix)".dependencies]
+libc = "0.2.189"
+
 [target."cfg(target_os = \"linux\")".dependencies]
 # X11 (x11rb, on by default) plus wlroots' virtual-pointer protocol, which is
 # what Sway and Hyprland expose to native Wayland clients.
@@ -27,9 +30,18 @@ serde_json = "1.0.151"
 # containers and minimal window managers included. Crashing on launch is worse
 # than a documented limitation.
 enigo = { version = "0.6.1", features = ["wayland"] }
+# winit's set_window_icon is a no-op on Wayland. These are the same crates
+# eframe already builds; they are named here so the window icon can be set on
+# winit's wl_display with xdg-toplevel-icon-v1.
+libc = "0.2"
+raw-window-handle = "0.6"
+wayland-backend = { version = "0.3.17", features = ["client_system"] }
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland"] }
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Media", "Win32_System_Console", "Win32_Foundation", "Win32_UI_HiDpi"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Media", "Win32_System_Console", "Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 
 [target."cfg(windows)".build-dependencies]
 winresource = "0.1.31"

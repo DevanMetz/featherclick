@@ -11,7 +11,7 @@ Single binary, no runtime dependencies, no background services.
 ## Features
 
 - **Human-like timing** — fixed interval, uniform random between a min and max, or
-  Gaussian (mean and sigma), all in milliseconds.
+  Gaussian (mean and sigma, within ±4 sigma), all in milliseconds.
 - **Random pixels in a range** — every click can land anywhere in a box, an
   ellipse, or a Gaussian spread around the target.
 - **Limits that stop it for you** — stop after *N* clicks, after *S* seconds, or
@@ -65,7 +65,7 @@ install -Dm644 featherclick.png ~/.local/share/icons/hicolor/256x256/apps/feathe
 | --- | --- | --- | --- | --- |
 | Clicking | ✅ | ✅ (Accessibility permission) | ✅ | ✅ wlroots only |
 | Global hotkeys | ✅ | ✅ | ✅ | ❌ — use the buttons |
-| Picking a position | ✅ | ✅ | ✅ | ✅ |
+| Picking a position | ✅ | ✅ | ✅ | ✅ via XWayland |
 
 On Wayland, clicking uses the compositor's virtual-pointer protocol, which
 wlroots-based compositors (Sway, Hyprland) provide. GNOME and KDE are not
@@ -73,9 +73,13 @@ covered: their only input path is the RemoteDesktop portal, and the upstream
 portal client aborts the process when no portal is present, so it is
 deliberately not compiled in — a crash on launch is worse than a documented
 gap. On compositors without virtual-pointer support, clicks still reach
-XWayland applications. Wayland has no equivalent of X11's global grabs, so
-hotkeys are unavailable there and the on-screen buttons are the way to drive
-it.
+XWayland applications. A click is sent to one server. When both Wayland and
+X11 are available, the virtual pointer clicks and X11 is only asked where
+the pointer is, because Wayland has no protocol for that. Pick, cursor
+jitter and stop-on-move need that reading and say so when it is missing.
+Wayland has no equivalent of X11's global grabs, so hotkeys are unavailable
+there. With no X11 display the window says so, and the on-screen buttons
+are the way to drive it.
 
 ## Using the window
 
@@ -132,12 +136,14 @@ settings. Passing `--clicks` or `--seconds` replaces both saved limits, so
 `--seconds 30` runs for 30 seconds even if the config also has a click cap, and
 `--clicks 20` is not cut short by a saved time limit.
 
-Exit status is `0` for a normal stop — including limits — `1` if the input
-backend could not be reached or failed during a run, and `2` for invalid
-arguments.
+Exit status is `0` for a normal stop — including limits and Ctrl+C — `1` if the
+input backend could not be reached or failed during a run, and `2` for invalid
+arguments. A second Ctrl+C exits immediately.
 
 Coordinates are physical screen pixels, measured from the top-left of the
-primary display.
+primary display, including other monitors. A display to the left or above
+the primary has negative coordinates. Windows and X11 accept those. On
+Wayland's virtual pointer a negative point is an error.
 
 ## Configuration
 
@@ -205,11 +211,12 @@ requested rate: asking for 1 ms measured 193 clicks/s. At that rate the loop
 used 3.1% of one core, and at 10 clicks/s the processor time was too small to
 measure at all.
 
-**Precision features are not decoration.** `stop-on-move`, the click counter and
-the elapsed timer are all sampled on the same loop as the clicks. The click cap
-is checked as soon as the final click is sent, and a time limit or pending stop
-interrupts a long interval rather than waiting it out, so a stop is noticed
-within one 25 ms sleep slice.
+**Precision features are not decoration.** The click cap is checked as soon as
+the final click is sent. A time limit, a pending stop, headless Ctrl+C and
+stop-on-move are sampled every 25 ms sleep slice, so each is noticed within
+one slice instead of at the next click. Stop-on-move watches the point the
+pointer was left at, so moving onto a fixed target is not the user taking the
+mouse. A hold releases the button when that stop arrives.
 
 **Lightness.** One process, one worker thread, an egui window that repaints only
 while a run is active or a countdown is on screen: 10 seconds of idle time

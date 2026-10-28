@@ -35,8 +35,8 @@ OTHER OPTIONS:
     -h, --help                  print this help
     -V, --version               print the version
 
-Exit status is 0 on success (including stop conditions), 1 on a runtime error,
-and 2 for invalid arguments.";
+Exit status is 0 on success (including stop conditions and Ctrl+C), 1 on a
+runtime error, and 2 for invalid arguments. A second Ctrl+C exits immediately.";
 
 #[derive(Debug, Default)]
 pub struct Args {
@@ -198,8 +198,10 @@ impl Run {
 
     /// Runs one session on the calling thread. Returns a process exit code.
     pub fn execute(self) -> u8 {
-        // A broken file must not become a click run. Defaults are not a
-        // substitute for the settings the user thought were loaded.
+        // Arm before connecting so an interrupt during a slow connection is retained.
+        crate::platform::arm_headless_interrupt();
+
+        // A broken file must not become a click run.
         let outcome = config::load_outcome();
         let settings = match settings_from(outcome, &self) {
             Ok(settings) => settings,
@@ -238,9 +240,16 @@ impl Run {
             SessionEvent::Captured(point) => println!("{},{}", point.0, point.1),
             SessionEvent::Stopped(reason) => stopped = Some(reason),
             SessionEvent::Started => {}
+            SessionEvent::Warning(message) => eprintln!("featherclick: {message}"),
         };
 
-        engine::run_session(&settings, &commands, &mut enigo, &mut sink);
+        engine::run_session(
+            &settings,
+            &commands,
+            &mut enigo,
+            &mut sink,
+            &crate::platform::interrupt_requested,
+        );
 
         let elapsed = start.elapsed().as_secs_f64();
         let reason = stopped.unwrap_or(StopReason::Shutdown);
