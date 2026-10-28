@@ -11,6 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+#[path = "pick_overlay.rs"]
+mod pick_overlay;
+
 #[cfg(any(not(windows), test))]
 use enigo::Coordinate;
 #[cfg(target_os = "linux")]
@@ -348,13 +352,20 @@ fn worker_loop(
                 if enigo.is_none() && deferred {
                     match crate::portal::read_cursor() {
                         Ok(point) => apply(status, SessionEvent::Captured(point), wake),
-                        Err(err) => apply(status, SessionEvent::Warning(err), wake),
+                        Err(err) => {
+                            capture_unreadable(err, &mut |event| apply(status, event, wake))
+                        }
                     }
                     continue;
                 }
                 // Retry the connection: a display may have appeared since launch.
                 if let Some(handle) = ensure_input(&mut enigo, status, wake) {
                     capture(handle, &mut |event| apply(status, event, wake));
+                } else {
+                    #[cfg(target_os = "linux")]
+                    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                        capture_unreadable(String::new(), &mut |event| apply(status, event, wake));
+                    }
                 }
             }
             Ok(Command::Start(settings)) | Ok(Command::Toggle(settings)) => {
@@ -421,8 +432,21 @@ fn apply(status: &Arc<Mutex<Status>>, event: SessionEvent, wake: &(dyn Fn() + Se
 fn capture(enigo: &mut impl Pointer, sink: &mut dyn FnMut(SessionEvent)) {
     match enigo.read_pointer() {
         Ok(point) => sink(SessionEvent::Captured(point)),
-        Err(err) => sink(SessionEvent::Warning(err)),
+        Err(err) => capture_unreadable(err, sink),
     }
+}
+
+fn capture_unreadable(err: String, sink: &mut dyn FnMut(SessionEvent)) {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        match pick_overlay::pick() {
+            Ok(Some(point)) => sink(SessionEvent::Captured(point)),
+            Ok(None) => {}
+            Err(error) => sink(SessionEvent::Warning(error)),
+        }
+        return;
+    }
+    sink(SessionEvent::Warning(err));
 }
 
 /// Outcome of draining pending commands mid-session.
