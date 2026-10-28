@@ -12,6 +12,8 @@ mod hotkeys;
 mod icon;
 mod platform;
 mod ui;
+#[cfg(target_os = "linux")]
+mod wayland_icon;
 
 use std::process::ExitCode;
 
@@ -54,7 +56,13 @@ fn main() -> ExitCode {
 }
 
 fn gui() -> ExitCode {
-    let settings = config::load();
+    let loaded = config::load_outcome();
+    if let Some(error) = &loaded.error {
+        // Release Windows builds have no console until this. Attach first so
+        // the message is visible when the window was started from a terminal.
+        platform::attach_console();
+        eprintln!("featherclick: {error}");
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("FeatherClick")
@@ -68,7 +76,7 @@ fn gui() -> ExitCode {
     let created = eframe::run_native(
         "FeatherClick",
         options,
-        Box::new(move |cc| Ok(Box::new(ui::App::new(cc, settings)))),
+        Box::new(move |cc| Ok(Box::new(ui::App::new(cc, loaded)))),
     );
 
     match created {

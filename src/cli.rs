@@ -28,15 +28,15 @@ RUN OPTIONS:
         --at <X,Y>              click a fixed screen point
         --jitter <PX>           vary the point by up to +-PX pixels
         --button <left|right|middle>
-        --delay <MS>            wait before the first click
+        --delay <MS>            wait before the first click; the time limit starts afterwards
         --quiet                 print only the final summary
 
 OTHER OPTIONS:
     -h, --help                  print this help
     -V, --version               print the version
 
-Exit status is 0 on success (including stop conditions), 1 on a runtime error,
-and 2 for invalid arguments.";
+Exit status is 0 on success (including stop conditions and Ctrl+C), 1 on a
+runtime error, and 2 for invalid arguments. A second Ctrl+C exits immediately.";
 
 #[derive(Debug, Default)]
 pub struct Args {
@@ -198,9 +198,18 @@ impl Run {
 
     /// Runs one session on the calling thread. Returns a process exit code.
     pub fn execute(self) -> u8 {
-        let mut settings = config::load();
-        self.apply(&mut settings);
-        settings.sanitize();
+        // Arm before connecting so an interrupt during a slow connection is retained.
+        crate::platform::arm_headless_interrupt();
+
+        // A broken file must not become a click run.
+        let outcome = config::load_outcome();
+        let settings = match settings_from(outcome, &self) {
+            Ok(settings) => settings,
+            Err(error) => {
+                eprintln!("featherclick: {error}");
+                return 1;
+            }
+        };
 
         let mut enigo = match engine::connect() {
             Ok(enigo) => enigo,
@@ -230,12 +239,18 @@ impl Run {
             }
             SessionEvent::Captured(point) => println!("{},{}", point.0, point.1),
             SessionEvent::Stopped(reason) => stopped = Some(reason),
-            SessionEvent::Started => {}
+            SessionEvent::Started { .. } | SessionEvent::Clicking => {}
+            SessionEvent::Warning(message) => eprintln!("featherclick: {message}"),
         };
 
-        // Headless has no window of its own, so nothing is held back.
-        let mut shield = engine::WindowShield::default();
-        engine::run_session(&settings, &commands, &mut enigo, &mut shield, &mut sink);
+        engine::run_session(
+            &settings,
+            &commands,
+            &mut enigo,
+            &mut engine::WindowShield::default(),
+            &mut sink,
+            &crate::platform::interrupt_requested,
+        );
 
         let elapsed = start.elapsed().as_secs_f64();
         let reason = stopped.unwrap_or(StopReason::Shutdown);
@@ -250,6 +265,19 @@ impl Run {
         );
         u8::from(reason.is_error())
     }
+}
+
+/// Saved settings plus this run's overrides. A load error is fatal: clicking
+/// with defaults would hide the broken file.
+fn settings_from(outcome: config::LoadOutcome, run: &Run) -> Result<Settings, String> {
+    let config::LoadOutcome { settings, error } = outcome;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    let mut settings = settings;
+    run.apply(&mut settings);
+    settings.sanitize();
+    Ok(settings)
 }
 
 fn describe(settings: &Settings) -> String {
@@ -280,7 +308,7 @@ fn describe(settings: &Settings) -> String {
     };
     let delay = match settings.start_delay_ms {
         0 => String::new(),
-        ms => format!(" after {ms} ms"),
+        ms => format!(", after {ms} ms"),
     };
     format!(
         "{} {} {}{jitter}, {limits}{delay}",
@@ -366,6 +394,58 @@ mod tests {
         };
         let run = applied(&saved, &["--interval", "10"]);
         assert_eq!((run.max_clicks, run.max_seconds), (50, 5));
+    }
+
+    #[test]
+    fn the_summary_keeps_the_delay_apart_from_the_limit() {
+        let settings = Settings {
+            timing: TimingMode::Fixed,
+            interval_ms: 100,
+            position: PositionMode::Fixed,
+            point: (1, 2),
+            max_seconds: 30,
+            start_delay_ms: 2_000,
+            ..Settings::default()
+        };
+        assert_eq!(
+            describe(&settings),
+            "left every 100 ms at 1,2, 30 s, after 2000 ms"
+        );
+    }
+
+    #[test]
+    fn a_broken_config_is_not_a_run_and_a_valid_one_keeps_explicit_limits() {
+        let broken = config::LoadOutcome {
+            settings: Settings {
+                max_clicks: 50,
+                ..Settings::default()
+            },
+            error: Some("cannot parse config.json: trailing comma".to_string()),
+        };
+        let error = settings_from(broken, &Run::default()).unwrap_err();
+        assert!(error.contains("cannot parse"), "{error}");
+
+        let saved = Settings {
+            max_clicks: 50,
+            max_seconds: 5,
+            interval_ms: 0,
+            ..Settings::default()
+        };
+        let run = Run {
+            seconds: Some(30),
+            ..Run::default()
+        };
+        let settings = settings_from(
+            config::LoadOutcome {
+                settings: saved,
+                error: None,
+            },
+            &run,
+        )
+        .unwrap();
+        assert_eq!(settings.max_seconds, 30);
+        assert_eq!(settings.max_clicks, 0);
+        assert_eq!(settings.interval_ms, 1, "a run uses the clamped interval");
     }
 
     #[test]

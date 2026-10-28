@@ -53,3 +53,14 @@ jobs:
           xvfb-run -a cargo run -- --headless --clicks 5 --interval 20 --at 40,40 --quiet | tee smoke.txt
           grep -q "5 clicks" smoke.txt
           grep -q "click limit reached" smoke.txt
+
+      # These move the pointer, so they stay ignored during ordinary `cargo test`
+      # and run here on a virtual display.
+      - name: Start delay (Xvfb)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: xvfb-run -a cargo test --bin featherclick -- --ignored --test-threads=1 start_delay
+      # The placement test moves the real pointer, so it stays ignored during
+      # the ordinary `cargo test` run and is only executed on a virtual display.
+      - name: Pointer placement (Xvfb)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: xvfb-run -a cargo test --bin featherclick -- --ignored pointer_placement
