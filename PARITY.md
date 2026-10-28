@@ -22,7 +22,8 @@ equivalent is named in the note.
 | Click limit | working | working | working | `src/engine.rs` |
 | Time limit | working | working | working | `src/engine.rs` |
 | Stop when the pointer moves | working | working | partial | `src/engine.rs` |
-| Global hotkeys (toggle and pick) | working | working | missing | `src/hotkeys.rs` |
+| Global hotkeys (toggle and pick) | working | working | partial — readable `/dev/input/event*` required; keys are not swallowed | `src/hotkeys.rs`, `src/evdev_keys.rs` |
+| Rebind a hotkey | working | working | partial — requires keyboard access | `src/ui.rs`, `src/hotkeys.rs`, `src/evdev_keys.rs` |
 | Dark / light theme | working | working | working | `src/ui.rs` |
 | Always on top | working | working | not possible | `src/ui.rs` |
 | Window icon | working | working | partial | `src/icon.rs`, `src/main.rs`, `src/wayland_icon.rs`, `assets/featherclick.desktop` |
@@ -55,8 +56,10 @@ The stop-on-move check itself runs after each click on every platform.
 
 ## Hotkeys
 
-`global-hotkey` on Linux is an X11 grab. A pure Wayland session has no
-binding. The on-screen buttons still start, stop, and pick.
+`global-hotkey` on X11 uses a grab. On Wayland the listener reads keyboard
+devices without grabbing them, so the focused window also receives the key.
+Access to `/dev/input/event*` is required, typically via the `input` group.
+The on-screen buttons still work without access.
 
 ## Always on top
 
