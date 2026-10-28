@@ -18,10 +18,10 @@ equivalent is named in the note.
 | Click at the pointer | working | working | partial | `src/engine.rs` |
 | Click a fixed point | working | working | partial | `src/engine.rs` |
 | Pick the pointer position | working | working | partial | `src/engine.rs`, `src/ui.rs` |
-| Jitter (off, box, ellipse, spread) | working | working | partial | `src/engine.rs` |
+| Jitter (off, box, ellipse, spread) | working | working — overflow-safe offsets; ellipse stays within its radii | partial — screen bounds remain backend-dependent | `src/engine.rs` |
 | Click limit | working | working | working | `src/engine.rs` |
 | Time limit | working | working | working | `src/engine.rs` |
-| Stop when the pointer moves | working | working | partial | `src/engine.rs` |
+| Stop when the pointer moves | working | working — tracks placed/clipped points during holds and double clicks | partial — requires pointer readings | `src/engine.rs` |
 | Global hotkeys (toggle and pick) | working | working | partial — readable `/dev/input/event*` required; keys are not swallowed | `src/hotkeys.rs`, `src/evdev_keys.rs` |
 | Rebind a hotkey | working | working | partial — requires keyboard access | `src/ui.rs`, `src/hotkeys.rs`, `src/evdev_keys.rs` |
 | Dark / light theme | working | working | working | `src/ui.rs` |

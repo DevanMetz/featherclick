@@ -713,6 +713,12 @@ impl<M: Pointer> Run<'_, M> {
     ) -> Result<ClickOutcome, String> {
         if places_pointer(self.settings) {
             self.enigo.place(target.0, target.1)?;
+            if self.settings.stop_on_move_px > 0 {
+                // Establish the new reference before checks inside holds/gaps.
+                // Screen edges and backend coordinate mapping may clamp the
+                // request. Watch the position actually reached when readable.
+                self.parked = Some(self.enigo.read_pointer().unwrap_or(target));
+            }
         }
         let button = Button::from(self.settings.button);
         match self.settings.style {
@@ -806,7 +812,6 @@ pub(crate) fn run_session(
     (run.sink)(SessionEvent::Clicking);
 
     let mut anchor = None;
-
     let mut clicks: u64 = 0;
     let mut next = Instant::now();
     loop {
@@ -864,12 +869,6 @@ pub(crate) fn run_session(
         clicks += outcome.presses;
         (run.sink)(SessionEvent::Trigger(clicks));
 
-        // Park on the point we just requested. Our own move is not the user
-        // taking the mouse; cursor mode keeps the anchor captured above.
-        if places_pointer(settings) && settings.stop_on_move_px > 0 {
-            run.parked = Some(target);
-        }
-
         if let Some(stopped) = outcome.stop {
             run.finish(stopped);
             return;
@@ -881,13 +880,7 @@ pub(crate) fn run_session(
             return;
         }
 
-        next += interval(settings);
-        let now = Instant::now();
-        if next < now {
-            // A slow click or a busy system put us behind; resynchronise rather
-            // than firing a burst to catch up.
-            next = now;
-        }
+        next = next_deadline(next, interval(settings), Instant::now());
         if let Some(stopped) = waiter.wait(next, &mut || run.stop_check()) {
             run.finish(stopped);
             return;
@@ -1042,7 +1035,33 @@ pub fn target_point(settings: &Settings, anchor: (i32, i32)) -> (i32, i32) {
             (x, y)
         }
     };
-    (anchor.0 + ox.round() as i32, anchor.1 + oy.round() as i32)
+    offset_target(anchor, ox, oy, settings.jitter == JitterMode::Ellipse)
+}
+
+fn offset_target(anchor: (i32, i32), ox: f64, oy: f64, ellipse: bool) -> (i32, i32) {
+    // Rounding outwards can put a boundary sample outside the ellipse.
+    let pixel = |v: f64| {
+        if ellipse {
+            v.trunc() as i32
+        } else {
+            v.round() as i32
+        }
+    };
+    (
+        anchor.0.saturating_add(pixel(ox)),
+        anchor.1.saturating_add(pixel(oy)),
+    )
+}
+
+fn next_deadline(previous: Instant, interval: Duration, now: Instant) -> Instant {
+    let planned = previous + interval;
+    if planned < now {
+        // Missed deadlines are discarded, including after suspend or a hold
+        // longer than the interval. Never emit a catch-up click immediately.
+        now + interval
+    } else {
+        planned
+    }
 }
 
 fn clamp_sigma(value: f64) -> f64 {
@@ -1088,22 +1107,32 @@ impl Waiter {
         deadline: Instant,
         abort: &mut dyn FnMut() -> Option<StopReason>,
     ) -> Option<StopReason> {
+        self.wait_with(deadline, abort, &mut Instant::now, &mut thread::sleep)
+    }
+
+    fn wait_with(
+        &mut self,
+        deadline: Instant,
+        abort: &mut dyn FnMut() -> Option<StopReason>,
+        now: &mut dyn FnMut() -> Instant,
+        sleep: &mut dyn FnMut(Duration),
+    ) -> Option<StopReason> {
         loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return None;
-            }
             if let Some(reason) = abort() {
                 return Some(reason);
             }
+            let sampled = now();
+            if sampled >= deadline {
+                return None;
+            }
             let wake = deadline.checked_sub(self.slack).unwrap_or(deadline);
-            let now = Instant::now();
-            if now < wake {
+            let sampled = now();
+            if sampled < wake {
                 // `slack >= SLACK_FLOOR > MIN_SLEEP`, so this never sleeps past the deadline.
-                let sleep_for = (wake - now).min(MAX_SLEEP_SLICE).max(MIN_SLEEP);
-                let intended = now + sleep_for;
-                thread::sleep(sleep_for);
-                let overshoot = Instant::now().saturating_duration_since(intended);
+                let sleep_for = (wake - sampled).min(MAX_SLEEP_SLICE).max(MIN_SLEEP);
+                let intended = sampled + sleep_for;
+                sleep(sleep_for);
+                let overshoot = now().saturating_duration_since(intended);
                 self.slack = (overshoot + SLACK_FLOOR).clamp(SLACK_FLOOR, SLACK_CEILING);
             } else {
                 std::hint::spin_loop();
@@ -1127,6 +1156,122 @@ mod tests {
         let mut s = Settings::default();
         s.sanitize();
         s
+    }
+
+    #[test]
+    fn deadlines_preserve_cadence_without_catching_up() {
+        let origin = Instant::now();
+        let step = Duration::from_millis(100);
+        assert_eq!(
+            next_deadline(origin, step, origin + Duration::from_millis(30)),
+            origin + step
+        );
+        // A hold or suspended process has missed its deadline.
+        for late in [101, 500, 60_000] {
+            let now = origin + Duration::from_millis(late);
+            assert_eq!(next_deadline(origin, step, now), now + step);
+        }
+        assert_eq!(next_deadline(origin, step, origin + step), origin + step);
+    }
+
+    #[test]
+    fn fake_clock_wait_slices_long_delays_and_checks_stop_after_suspend() {
+        let origin = Instant::now();
+        let elapsed = RefCell::new(Duration::ZERO);
+        let sleeps = RefCell::new(Vec::new());
+        let mut checks = 0;
+        let reason = Waiter::new().wait_with(
+            origin + Duration::from_secs(30),
+            &mut || {
+                checks += 1;
+                (checks == 2).then_some(StopReason::User)
+            },
+            &mut || origin + *elapsed.borrow(),
+            &mut |slice| {
+                sleeps.borrow_mut().push(slice);
+                // The machine suspends during the first sleep.
+                *elapsed.borrow_mut() += Duration::from_secs(60);
+            },
+        );
+        assert_eq!(reason, Some(StopReason::User));
+        assert_eq!(*sleeps.borrow(), vec![MAX_SLEEP_SLICE]);
+    }
+
+    #[test]
+    fn expired_wait_still_checks_stop_before_delivering() {
+        assert_eq!(
+            Waiter::new().wait(Instant::now(), &mut || Some(StopReason::User)),
+            Some(StopReason::User)
+        );
+    }
+
+    #[test]
+    fn jitter_pixels_respect_shapes_and_integer_extremes() {
+        assert_eq!(
+            offset_target((i32::MAX, i32::MIN), 100.0, -100.0, false),
+            (i32::MAX, i32::MIN)
+        );
+        // Rounding (0.71, 0.71) to (1, 1) would leave a unit circle.
+        assert_eq!(offset_target((0, 0), 0.71, -0.71, true), (0, 0));
+        for angle in 0..360 {
+            let angle = f64::from(angle).to_radians();
+            let (x, y) = offset_target((0, 0), 30.0 * angle.cos(), 10.0 * angle.sin(), true);
+            assert!((f64::from(x) / 30.0).powi(2) + (f64::from(y) / 10.0).powi(2) <= 1.0);
+        }
+        assert!(!moved_away(
+            (i32::MIN, i32::MIN),
+            (i32::MIN, i32::MIN),
+            u32::MAX
+        ));
+        assert!(moved_away(
+            (i32::MIN, i32::MIN),
+            (i32::MAX, i32::MAX),
+            u32::MAX
+        ));
+    }
+
+    #[test]
+    fn limits_include_the_exact_boundary_and_exclude_start_delay() {
+        let mut s = armed(100, 3);
+        assert!(!click_limit_reached(&s, 2));
+        assert!(click_limit_reached(&s, 3));
+        s.max_seconds = 1;
+        let now = Instant::now();
+        assert!(!time_limit_due(&s, None, now));
+        assert!(!time_limit_due(
+            &s,
+            Some(now),
+            now + Duration::from_millis(999)
+        ));
+        assert!(time_limit_due(&s, Some(now), now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn relocating_a_fixed_point_does_not_abort_holds_or_double_gaps() {
+        for style in [ClickStyle::Hold, ClickStyle::Double] {
+            let mut s = armed(1, 4);
+            s.style = style;
+            s.hold_ms = 1;
+            s.stop_on_move_px = 1;
+            let (_tx, rx) = channel();
+            let mut mouse = FakePointer::at((0, 0));
+            let mut shield = WindowShield::default();
+            let mut sink = |_| {};
+            let mut run = Run {
+                settings: &s,
+                clicking_from: None,
+                parked: Some((0, 0)),
+                rx: &rx,
+                shield: &mut shield,
+                enigo: &mut mouse,
+                sink: &mut sink,
+                interrupt: &|| false,
+            };
+            let outcome = run.deliver(&mut Waiter::new(), (40, 40), 0).unwrap();
+            assert_eq!(outcome.stop, None);
+            assert_eq!(outcome.presses, presses_per_trigger(style));
+            assert_buttons_released(&mouse);
+        }
     }
 
     #[test]
@@ -1251,8 +1396,8 @@ mod tests {
         s.jitter = JitterMode::Ellipse;
         s.jitter_x = 20;
         s.jitter_y = 20;
-        // Offsets are rounded to whole pixels, so the bound carries 1px of slack.
-        let reach = 21.0 * 21.0;
+        // Pixel conversion must not push a boundary draw outside the disc.
+        let reach = 20.0 * 20.0;
         let mut away_from_centre = false;
         for _ in 0..20_000 {
             let (x, y) = target_point(&s, anchor);
@@ -1924,9 +2069,9 @@ mod tests {
         let mut mouse = FakePointer::at((40, 40));
         {
             let mut inner = mouse.inner.borrow_mut();
-            // The sample taken as the wait starts still sees the placed point.
+            // Read 1 plans the click, read 2 confirms the placed point.
             // The next sample, during the interval, sees the user leave.
-            inner.jump_after = Some(1);
+            inner.jump_after = Some(2);
             inner.jump = (40, 80);
         }
         let (tx, rx) = channel();
@@ -2195,6 +2340,30 @@ mod tests {
 
         let other = explain_location("connection reset", Some("ignored"));
         assert_eq!(other, "cannot read the pointer position: connection reset");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "moves the pointer; run under xvfb"]
+    fn screen_edge_clipping_is_not_treated_as_user_movement() {
+        let mut pointer = connect().expect("Xvfb connection");
+        let mut s = armed(5, 2);
+        s.point = (-100, -100);
+        s.style = ClickStyle::Hold;
+        s.hold_ms = 1;
+        s.stop_on_move_px = 1;
+        let (_tx, rx) = channel();
+        let mut events = Vec::new();
+        run_session(
+            &s,
+            &rx,
+            &mut pointer,
+            &mut WindowShield::default(),
+            &mut |event| events.push(event),
+            &|| false,
+        );
+        assert_eq!(stop_reason(&events), StopReason::ClickLimit);
+        assert_eq!(pointer.read_pointer().unwrap(), (0, 0));
     }
 
     /// Moves the pointer. Run under Xvfb, not on a desktop session:
