@@ -16,8 +16,8 @@ equivalent is named in the note.
 | Fixed, uniform, and human-like intervals | working | working | working | `src/engine.rs`, `src/config.rs` |
 | Start delay | working | working | working | `src/engine.rs` |
 | Click at the pointer | working | working | partial | `src/engine.rs` |
-| Click a fixed point | working | working | partial | `src/engine.rs` |
-| Pick the pointer position | working | working | partial | `src/engine.rs`, `src/ui.rs` |
+| Click a fixed point | working | working | working | `src/engine.rs` |
+| Pick the pointer position | working | working | working | `src/engine.rs`, `src/ui.rs`, `src/pick_overlay.rs` |
 | Jitter (off, box, ellipse, spread) | working | working | partial | `src/engine.rs` |
 | Click limit | working | working | working | `src/engine.rs` |
 | Time limit | working | working | working | `src/engine.rs` |
@@ -48,8 +48,13 @@ and headless mode use the same engine.
 ## Pointer location
 
 The Wayland virtual pointer does not report its position. An X11-only connection
-reads it when available; otherwise Pick, cursor jitter, and stop-on-move report
-that the position is unavailable. X11 reads the pointer directly.
+reads it when available; otherwise Pick opens a dimmed fullscreen window on
+each output. The next click selects a logical point; Esc cancels. The picker
+uses xdg-output origins and logical sizes, including negative origins and
+fractional scaling, without requesting portal access. It requires xdg-shell
+and xdg-output and has not been tested on a live compositor. Cursor jitter
+and stop-on-move still report that the position is unavailable. X11 and
+Windows read the pointer directly.
 
 The stop-on-move check itself runs after each click on every platform.
 
@@ -100,4 +105,4 @@ logical layout and cannot ask for physical pixels. The closest equivalent is
 that logical point.
 
 
-GNOME and KDE use the RemoteDesktop portal when no virtual pointer is available. Permission is requested when a run starts and the restore token is saved with mode 0600. A missing or refused portal falls back to XWayland. Portal clicks use the stream’s logical layout, including negative monitor origins. Picking reads through X11 without opening a portal session.
+GNOME and KDE use the RemoteDesktop portal when no virtual pointer is available. Permission is requested when a run starts and the restore token is saved with mode 0600. A missing or refused portal falls back to XWayland. Portal clicks use the stream’s logical layout, including negative monitor origins. Picking reads through X11 when available, otherwise uses the native Wayland overlay without opening a portal session.
