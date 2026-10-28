@@ -78,8 +78,9 @@ X11 are available, the virtual pointer clicks and X11 is only asked where
 the pointer is, because Wayland has no protocol for that. Pick, cursor
 jitter and stop-on-move need that reading and say so when it is missing.
 Wayland has no equivalent of X11's global grabs, so hotkeys are unavailable
-there. With no X11 display the window says so, and the on-screen buttons
-are the way to drive it.
+there and the on-screen buttons are the way to drive it. The compositor does
+not report the window position, so a fixed point is not compared with the
+window; pointer mode waits while the pointer is over it.
 
 ## Using the window
 
@@ -88,10 +89,12 @@ are the way to drive it.
    anything watching for automation; `Human-like` gives a Gaussian spread.
 3. Choose a **Target**:
    - **Pointer** clicks wherever the pointer already is and never moves it, so
-     you can keep repositioning while it runs.
-   - **Fixed** returns to a point before every click. Type coordinates, or press
-     **Pick** and the position is taken after a 3 second countdown, or press the
-     pick hotkey (`F7` by default) while hovering the target.
+     you can keep repositioning while it runs. It waits while the pointer is
+     over the FeatherClick window.
+   - **Fixed** returns to a point before every click, and waits while that point
+     is covered by the window. Type coordinates, or press **Pick** and the
+     position is taken after a 3 second countdown, or press the pick hotkey
+     (`F7` by default) while hovering the target.
 4. Optionally add **Jitter** — the spread around the target, in pixels.
 5. Set **Limits** if you want the run to end by itself.
 6. Press **Start** (or the toggle hotkey).

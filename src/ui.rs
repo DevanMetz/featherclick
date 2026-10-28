@@ -14,7 +14,7 @@ use egui::{Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke
 use crate::config::{
     self, ClickStyle, JitterMode, MouseButton, PositionMode, Settings, Theme, TimingMode,
 };
-use crate::engine::{Status, Worker};
+use crate::engine::{ScreenRect, Status, WindowShield, Worker};
 use crate::hotkeys::{self, Action, Code, Gate, GlobalHotKeyEvent, Hotkeys};
 
 #[cfg(target_os = "linux")]
@@ -56,6 +56,9 @@ pub struct App {
     changed_at: Instant,
     applied_theme: Option<Theme>,
     applied_on_top: Option<bool>,
+    /// Last window bounds sent to the engine. Compared so an idle frame does
+    /// not enqueue the same rectangle again.
+    sent_shield: Option<WindowShield>,
     save_error: Option<String>,
     /// Keeps the Wayland icon buffers alive for the life of the window.
     #[cfg(target_os = "linux")]
@@ -103,6 +106,7 @@ impl App {
             changed_at: Instant::now(),
             applied_theme: None,
             applied_on_top: None,
+            sent_shield: None,
             save_error: None,
             #[cfg(target_os = "linux")]
             wayland_icon: None,
@@ -205,6 +209,15 @@ impl App {
             hotkeys::CaptureResult::Cancel => self.end_capture(None),
             hotkeys::CaptureResult::Binding(binding) => self.end_capture(Some(binding)),
             hotkeys::CaptureResult::Ignore => {}
+        }
+    }
+
+    /// Tells the engine where this window is, once that changes.
+    fn publish_window(&mut self, ctx: &egui::Context) {
+        let shield = window_shield(ctx);
+        if self.sent_shield != Some(shield) {
+            self.sent_shield = Some(shield);
+            self.worker.set_window(shield);
         }
     }
 
@@ -731,6 +744,9 @@ impl eframe::App for App {
 
         let ctx = ui.ctx().clone();
         self.apply_window(&ctx);
+        // Before the Start button is handled, so the worker has the rectangle
+        // queued ahead of the command that would click it.
+        self.publish_window(&ctx);
         self.poll(&ctx);
 
         let before = self.settings.clone();
@@ -1120,9 +1136,82 @@ fn key_to_code(key: egui::Key) -> Option<Code> {
     })
 }
 
+/// Converts a viewport rectangle from ui points into physical pixels, outset
+/// by one pixel so rounding cannot leave the real edge clickable.
+fn rect_from_points(
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+    ppp: f32,
+) -> Option<ScreenRect> {
+    if ![min_x, min_y, max_x, max_y, ppp]
+        .iter()
+        .all(|value| value.is_finite())
+        || ppp <= 0.0
+    {
+        return None;
+    }
+    let x0 = (min_x * ppp).floor() as i32;
+    let y0 = (min_y * ppp).floor() as i32;
+    let x1 = (max_x * ppp).ceil() as i32;
+    let y1 = (max_y * ppp).ceil() as i32;
+    if x1 < x0 || y1 < y0 {
+        return None;
+    }
+    Some(ScreenRect {
+        x: x0.saturating_sub(1),
+        y: y0.saturating_sub(1),
+        width: x1.saturating_sub(x0).saturating_add(2),
+        height: y1.saturating_sub(y0).saturating_add(2),
+    })
+}
+
+fn window_shield(ctx: &egui::Context) -> WindowShield {
+    ctx.input(|input| {
+        let rect = input.viewport().outer_rect.and_then(|rect| {
+            rect_from_points(
+                rect.min.x,
+                rect.min.y,
+                rect.max.x,
+                rect.max.y,
+                input.pixels_per_point,
+            )
+        });
+        WindowShield {
+            rect,
+            pointer_over: input.pointer.hover_pos().is_some(),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rect_from_points_scales_outsets_and_rejects_garbage() {
+        let rect = rect_from_points(10.0, 20.0, 110.0, 220.0, 1.0).unwrap();
+        assert_eq!((rect.x, rect.y, rect.width, rect.height), (9, 19, 102, 202));
+
+        let scaled = rect_from_points(10.0, 3.0, 14.5, 8.0, 2.0).unwrap();
+        assert_eq!(
+            (scaled.x, scaled.y, scaled.width, scaled.height),
+            (19, 5, 11, 12)
+        );
+
+        let negative = rect_from_points(-10.5, -3.25, -1.5, 4.0, 1.0).unwrap();
+        assert_eq!(
+            (negative.x, negative.y, negative.width, negative.height),
+            (-12, -5, 12, 10)
+        );
+
+        assert!(rect_from_points(0.0, 0.0, 10.0, 10.0, 0.0).is_none());
+        assert!(rect_from_points(0.0, 0.0, 10.0, 10.0, -1.0).is_none());
+        assert!(rect_from_points(f32::NAN, 0.0, 10.0, 10.0, 1.0).is_none());
+        assert!(rect_from_points(0.0, 0.0, f32::INFINITY, 10.0, 1.0).is_none());
+        assert!(rect_from_points(20.0, 0.0, 10.0, 10.0, 1.0).is_none());
+    }
 
     #[test]
     fn the_delay_counts_down_until_clicking_starts() {

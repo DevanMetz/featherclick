@@ -247,6 +247,7 @@ impl Run {
             &settings,
             &commands,
             &mut enigo,
+            &mut engine::WindowShield::default(),
             &mut sink,
             &crate::platform::interrupt_requested,
         );
