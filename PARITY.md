@@ -1,25 +1,92 @@
 # Linux parity
 
-User-facing Windows behaviour, and where Linux stands. X11 was checked on this tree (clicks, the F8 grab, always-on-top). Wayland notes are from the code paths: there is no Wayland session here, and the hotkey listener is unit-tested rather than run against `/dev/input`.
+Windows is the reference. Each row is a user-facing feature or setting, and
+the Linux columns are for the code on this branch. X11 and Wayland are split
+where they differ.
 
-| Feature | Windows | Linux X11 | Linux Wayland | Files |
+`working` means the feature behaves as it does on Windows. `partial` means
+some sessions or inputs work. `missing` means the control does nothing useful.
+`not possible` means a client cannot provide the Windows behavior; the closest
+equivalent is named in the note.
+
+| Feature | Windows | X11 | Wayland | Files |
 | --- | --- | --- | --- | --- |
-| Left, right, and middle click | working | working | partial — wlroots virtual pointer only; GNOME and KDE are left out because enigo's portal client aborts when no portal is present | `src/engine.rs`, `Cargo.toml` |
-| Single, double, and hold | working | working | partial — same limit as clicking | `src/engine.rs` |
-| Fixed, random, and human-like intervals | working | working | working — `nanosleep` is already fine-grained, so there is no `timeBeginPeriod` step | `src/engine.rs`, `src/platform.rs` |
-| Start delay | working | working | working | `src/engine.rs`, `src/ui.rs` |
-| Click at the pointer | working | working | partial — the virtual pointer cannot report a position, so cursor mode, jitter, and stop-on-move have nothing to measure | `src/engine.rs` |
-| Click a fixed point | working | working | partial — absolute motion uses the first output, and negative coordinates are rejected | `src/engine.rs` |
-| Pick a position | working | working | partial — fails when the pointer position cannot be read | `src/engine.rs`, `src/ui.rs` |
-| Jitter (box, ellipse, spread) | working | working | partial — needs a pointer move, same limit as a fixed point | `src/engine.rs` |
-| Click limit and time limit | working | working | working | `src/engine.rs` |
-| Stop when the pointer moves | working | working | partial — with no pointer position the limit never trips | `src/engine.rs` |
-| Global hotkeys | working | working | partial — evdev when `/dev/input/event*` is readable; the key is not swallowed, because Wayland has no per-key grab | `src/evdev_keys.rs`, `src/hotkeys.rs` |
-| Rebind a hotkey | working | working | partial — the window captures the chord; it is armed on the evdev listener when that listener could open a keyboard | `src/ui.rs`, `src/hotkeys.rs`, `src/evdev_keys.rs` |
-| Dark and light theme | working | working | working | `src/ui.rs` |
-| Always on top | working | working | missing — core Wayland has no client stacking request, and winit's `set_window_level` is a no-op. Layer-shell would cover wlroots only, and it is not a normal window | `src/ui.rs` |
-| Window icon | working | working | missing — `set_window_icon` is a no-op. The launcher still uses `featherclick.desktop` | `src/icon.rs`, `assets/` |
-| Headless mode | working | working | partial — needs the virtual pointer, or XWayland | `src/cli.rs`, `src/engine.rs` |
+| Left, right, and middle click | working | working | partial | `src/engine.rs`, `Cargo.toml` |
+| Single, double, and hold | working | working | partial | `src/engine.rs` |
+| Fixed, uniform, and human-like intervals | working | working | working | `src/engine.rs`, `src/config.rs` |
+| Start delay | working | working | working | `src/engine.rs` |
+| Click at the pointer | working | working | partial | `src/engine.rs` |
+| Click a fixed point | working | working | partial | `src/engine.rs` |
+| Pick the pointer position | working | working | partial | `src/engine.rs`, `src/ui.rs` |
+| Jitter (off, box, ellipse, spread) | working | working | partial | `src/engine.rs` |
+| Click limit | working | working | working | `src/engine.rs` |
+| Time limit | working | working | working | `src/engine.rs` |
+| Stop when the pointer moves | working | working | partial | `src/engine.rs` |
+| Global hotkeys (toggle and pick) | working | working | partial — readable `/dev/input/event*` required; keys are not swallowed | `src/hotkeys.rs`, `src/evdev_keys.rs` |
+| Rebind a hotkey | working | working | partial — requires keyboard access | `src/ui.rs`, `src/hotkeys.rs`, `src/evdev_keys.rs` |
+| Dark / light theme | working | working | working | `src/ui.rs` |
+| Always on top | working | working | not possible | `src/ui.rs` |
+| Window icon | working | working | partial | `src/icon.rs`, `src/main.rs`, `src/wayland_icon.rs`, `assets/featherclick.desktop` |
 | Saved settings | working | working | working | `src/config.rs` |
-| Physical pixel coordinates | working — per-monitor DPI v2 | working — X server pixels | partial — the virtual pointer's extent is one output, with no fractional-scale adjustment | `src/platform.rs`, `src/engine.rs` |
-| Headless stdout | working — reattach the parent console | working — the process is never detached | working | `src/platform.rs` |
+| Headless mode | working | working | partial | `src/cli.rs`, `src/engine.rs` |
+| Screen coordinates | working | working | not possible | `src/platform.rs` |
+
+## Clicking and fixed points
+
+Wayland clicks go through wlroots' virtual pointer (Sway, Hyprland). GNOME and
+KDE do not offer that protocol. enigo's libei portal client is not compiled
+in: it aborts when `org.freedesktop.portal.Desktop` is absent (`Cargo.toml`).
+
+On a session where both an X11 display and a Wayland socket are reachable,
+enigo opens both and sends each button and each move to both.
+
+A fixed Wayland point uses the first output's size only, and a negative
+coordinate is rejected. Jitter, hold, and double click share that path, so
+they are partial on Wayland for the same reason. Headless mode uses the same
+engine.
+
+## Pointer location
+
+enigo's Wayland backend does not implement `location()`. The Linux backend
+asks Wayland first and does not fall through to X11, so on a Wayland
+connection Pick does not update the point, cursor mode keeps the saved point,
+and stop-on-move never sees movement. X11 reads the pointer.
+
+The stop-on-move check itself runs after each click on every platform.
+
+## Hotkeys
+
+`global-hotkey` on X11 uses a grab. On Wayland the listener reads keyboard
+devices without grabbing them, so the focused window also receives the key.
+Access to `/dev/input/event*` is required, typically via the `input` group.
+The on-screen buttons still work without access.
+
+## Always on top
+
+Not possible on Wayland. No standard protocol lets an ordinary client keep a
+window above others. KDE's plasma-window-management protocol has
+`keep_above`, and it says regular clients must not bind it and that only one
+client may. Layer-shell would replace the xdg toplevel winit already created.
+Sway's sticky flag is a different behavior. The checkbox still sends
+`WindowLevel::AlwaysOnTop`; winit ignores it on Wayland. On X11, winit sets
+`_NET_WM_STATE_ABOVE`.
+
+## Window icon
+
+Windows embeds `assets/icon.ico` and winit sets the window icons. X11 sets
+`_NET_WM_ICON` from the same RGBA image (`src/main.rs`).
+
+On Wayland, winit's `set_window_icon` does nothing. This branch attaches the
+icon with `xdg-toplevel-icon-v1` when the compositor offers it, on the
+`wl_display` and `xdg_toplevel` winit already owns (`src/wayland_icon.rs`).
+The buffer is premultiplied ARGB8888. The icon name is `featherclick`. The
+64px image is always sent, plus any edge from 1 to 256 that the compositor
+asks for. If the protocol is absent, taskbars keep the desktop-file icon
+(`assets/featherclick.desktop`). The window does not say so.
+
+## Screen coordinates
+
+Windows asks for per-monitor DPI v2 so coordinates are physical pixels.
+X11 coordinates are pixels. A Wayland client only sees the compositor's
+logical layout and cannot ask for physical pixels. The closest equivalent is
+that logical point.
