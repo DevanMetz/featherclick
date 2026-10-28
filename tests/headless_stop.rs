@@ -23,7 +23,7 @@ struct PrivateDisplay {
 
 impl PrivateDisplay {
     fn start() -> Option<Self> {
-        for _ in 0..20 {
+        for _ in 0..1000 {
             let number = NEXT_DISPLAY.fetch_add(1, Ordering::Relaxed);
             let name = format!(":{number}");
             let socket = format!("/tmp/.X11-unix/X{number}");

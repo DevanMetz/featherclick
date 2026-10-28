@@ -198,13 +198,18 @@ impl Run {
 
     /// Runs one session on the calling thread. Returns a process exit code.
     pub fn execute(self) -> u8 {
-        // Before connect, so a Ctrl+C during a slow display connection still
-        // arms the "press again to quit" path and is waiting when the loop starts.
+        // Arm before connecting so an interrupt during a slow connection is retained.
         crate::platform::arm_headless_interrupt();
 
-        let mut settings = config::load();
-        self.apply(&mut settings);
-        settings.sanitize();
+        // A broken file must not become a click run.
+        let outcome = config::load_outcome();
+        let settings = match settings_from(outcome, &self) {
+            Ok(settings) => settings,
+            Err(error) => {
+                eprintln!("featherclick: {error}");
+                return 1;
+            }
+        };
 
         let mut enigo = match engine::connect() {
             Ok(enigo) => enigo,
@@ -259,6 +264,19 @@ impl Run {
         );
         u8::from(reason.is_error())
     }
+}
+
+/// Saved settings plus this run's overrides. A load error is fatal: clicking
+/// with defaults would hide the broken file.
+fn settings_from(outcome: config::LoadOutcome, run: &Run) -> Result<Settings, String> {
+    let config::LoadOutcome { settings, error } = outcome;
+    if let Some(error) = error {
+        return Err(error);
+    }
+    let mut settings = settings;
+    run.apply(&mut settings);
+    settings.sanitize();
+    Ok(settings)
 }
 
 fn describe(settings: &Settings) -> String {
@@ -375,6 +393,41 @@ mod tests {
         };
         let run = applied(&saved, &["--interval", "10"]);
         assert_eq!((run.max_clicks, run.max_seconds), (50, 5));
+    }
+
+    #[test]
+    fn a_broken_config_is_not_a_run_and_a_valid_one_keeps_explicit_limits() {
+        let broken = config::LoadOutcome {
+            settings: Settings {
+                max_clicks: 50,
+                ..Settings::default()
+            },
+            error: Some("cannot parse config.json: trailing comma".to_string()),
+        };
+        let error = settings_from(broken, &Run::default()).unwrap_err();
+        assert!(error.contains("cannot parse"), "{error}");
+
+        let saved = Settings {
+            max_clicks: 50,
+            max_seconds: 5,
+            interval_ms: 0,
+            ..Settings::default()
+        };
+        let run = Run {
+            seconds: Some(30),
+            ..Run::default()
+        };
+        let settings = settings_from(
+            config::LoadOutcome {
+                settings: saved,
+                error: None,
+            },
+            &run,
+        )
+        .unwrap();
+        assert_eq!(settings.max_seconds, 30);
+        assert_eq!(settings.max_clicks, 0);
+        assert_eq!(settings.interval_ms, 1, "a run uses the clamped interval");
     }
 
     #[test]

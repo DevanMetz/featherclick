@@ -190,7 +190,10 @@ directly:
 
 Missing or unknown fields are ignored, so a partial file still loads. Values are
 clamped into usable ranges on load — for example an inverted min/max pair is
-swapped rather than rejected.
+swapped rather than rejected. A file that does not parse is left untouched.
+The window opens on defaults and reports the error; a headless run exits with
+status 1 instead of clicking with those defaults. The first save after an edit
+copies the old file to `config.json.bak` and then replaces it.
 
 ## How it works
 
@@ -223,9 +226,11 @@ system GUI toolkit, no web view and no scripting engine. Accessibility tree
 support is compiled out to keep the binary small, which means the UI is not
 exposed to screen readers.
 
-**State.** The engine snapshots your settings when a run starts, so a run cannot
-change shape halfway through. The UI writes settings to disk 400 ms after the
-last edit, atomically, so an interrupted save cannot truncate the file.
+**State.** The engine snapshots your settings when a run starts and clamps them
+the same way a load does, so a run cannot change shape halfway through. The
+window writes the file 400 ms after the last edit, and on close if that edit
+is still unsaved. It does not write on launch. The new contents are flushed
+before the file is replaced, so a crash cannot leave it half-written.
 
 ## Building
 
