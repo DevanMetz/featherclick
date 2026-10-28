@@ -16,17 +16,18 @@ equivalent is named in the note.
 | Fixed, uniform, and human-like intervals | working | working | working | `src/engine.rs`, `src/config.rs` |
 | Start delay | working | working | working | `src/engine.rs` |
 | Click at the pointer | working | working | partial | `src/engine.rs` |
-| Click a fixed point | working | working | partial | `src/engine.rs` |
-| Pick the pointer position | working | working | partial | `src/engine.rs`, `src/ui.rs` |
+| Click a fixed point | working | working | working | `src/engine.rs` |
+| Pick the pointer position | working | working | working | `src/engine.rs`, `src/ui.rs`, `src/pick_overlay.rs` |
 | Jitter (off, box, ellipse, spread) | working | working | partial | `src/engine.rs` |
 | Click limit | working | working | working | `src/engine.rs` |
 | Time limit | working | working | working | `src/engine.rs` |
 | Stop when the pointer moves | working | working | partial | `src/engine.rs` |
-| Global hotkeys (toggle and pick) | working | working | partial — readable `/dev/input/event*` required; keys are not swallowed | `src/hotkeys.rs`, `src/evdev_keys.rs` |
-| Rebind a hotkey | working | working | partial — requires keyboard access | `src/ui.rs`, `src/hotkeys.rs`, `src/evdev_keys.rs` |
+| Global hotkeys (toggle and pick) | working | working | working with GlobalShortcuts portal; evdev fallback requires readable `/dev/input/event*` and does not swallow keys | `src/hotkeys.rs`, `src/portal_hotkeys.rs`, `src/evdev_keys.rs` |
+| Rebind a hotkey | working | working | working with GlobalShortcuts portal; evdev fallback requires keyboard access | `src/ui.rs`, `src/hotkeys.rs`, `src/portal_hotkeys.rs`, `src/evdev_keys.rs` |
 | Dark / light theme | working | working | working | `src/ui.rs` |
 | Always on top | working | working | not possible | `src/ui.rs` |
 | Window icon | working | working | partial | `src/icon.rs`, `src/main.rs`, `src/wayland_icon.rs`, `assets/featherclick.desktop` |
+| Window startup | working | working — checks X11 keyboard libraries after Wayland fallback | working — probes the connection before selecting Wayland | `src/main.rs`, `src/xkb_check.rs` |
 | Saved settings | working | working | working | `src/config.rs` |
 | Headless mode | working | working | partial — desktop session and compositor permission required; pointer reads may require XWayland | `src/cli.rs`, `src/input.rs`, `src/portal.rs`, `src/engine.rs` |
 | Screen coordinates | working | working | not possible | `src/platform.rs` |
@@ -47,17 +48,31 @@ and headless mode use the same engine.
 ## Pointer location
 
 The Wayland virtual pointer does not report its position. An X11-only connection
-reads it when available; otherwise Pick, cursor jitter, and stop-on-move report
-that the position is unavailable. X11 reads the pointer directly.
+reads it when available; otherwise Pick opens a dimmed fullscreen window on
+each output. The next click selects a logical point; Esc cancels. The picker
+uses xdg-output origins and logical sizes, including negative origins and
+fractional scaling, without requesting portal access. It requires xdg-shell
+and xdg-output and has not been tested on a live compositor. Cursor jitter
+and stop-on-move still report that the position is unavailable. X11 and
+Windows read the pointer directly.
 
 The stop-on-move check itself runs after each click on every platform.
 
 ## Hotkeys
 
-`global-hotkey` on X11 uses a grab. On Wayland the listener reads keyboard
-devices without grabbing them, so the focused window also receives the key.
-Access to `/dev/input/event*` is required, typically via the `input` group.
-The on-screen buttons still work without access.
+`global-hotkey` on X11 uses a grab. Wayland prefers the
+[GlobalShortcuts portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html)
+for toggle and pick, without `/dev/input` access. The desktop controls approval,
+key consumption and the final shortcuts; configured keys are preferred triggers
+and the desktop may override them. Rebinding closes the old session and registers
+the new triggers in a fresh session, which may show another approval dialog.
+
+When the portal is missing, refuses registration, or does not bind both requested
+actions, FeatherClick falls back to the existing keyboard device listener.
+That fallback requires readable `/dev/input/event*` (typically via the `input`
+group) and the focused window also receives the key. XWayland grabs cannot see
+native Wayland windows, so grabs are used only in X11 sessions. The on-screen
+buttons still work when neither Wayland backend is available.
 
 ## Always on top
 
@@ -90,7 +105,7 @@ logical layout and cannot ask for physical pixels. The closest equivalent is
 that logical point.
 
 
-GNOME and KDE use the RemoteDesktop portal when no virtual pointer is available. Permission is requested when a run starts and the restore token is saved with mode 0600. A missing or refused portal falls back to XWayland. Portal clicks use the stream’s logical layout, including negative monitor origins. Picking reads through X11 without opening a portal session.
+GNOME and KDE use the RemoteDesktop portal when no virtual pointer is available. Permission is requested when a run starts and the restore token is saved with mode 0600. A missing or refused portal falls back to XWayland. Portal clicks use the stream’s logical layout, including negative monitor origins. Picking reads through X11 when available, otherwise uses the native Wayland overlay without opening a portal session.
 
 ## Headless mode
 
@@ -105,3 +120,4 @@ readable pointer coordinates, usually through XWayland; unavailable reads fail
 the run rather than silently dropping the setting. No working backend or a
 runtime failure exits 1; invalid arguments exit 2 with a short error. Live
 Wayland compositor behavior has not been verified, so parity remains partial.
+
