@@ -40,6 +40,7 @@ wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client", "unstable", "staging"] }
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "wayland"] }
+xkbcommon-dl = { version = "0.4.2", features = ["x11"] }
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Media", "Win32_System_Console", "Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
