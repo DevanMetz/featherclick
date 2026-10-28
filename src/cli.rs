@@ -17,8 +17,8 @@ USAGE:
     featherclick [OPTIONS]
 
 With no options the settings window opens. Any run option clicks without opening
-a window, using the saved settings as defaults. A limit of 0 means unlimited;
-passing --clicks or --seconds replaces both saved limits.
+a FeatherClick window, using saved settings as defaults. A limit of 0 means
+unlimited; passing --clicks or --seconds replaces both saved limits.
 
 RUN OPTIONS:
         --headless              click without opening a window
@@ -26,7 +26,8 @@ RUN OPTIONS:
         --seconds <S>           stop after S seconds
         --interval <MS>         click every MS milliseconds
         --at <X,Y>              click a fixed screen point
-        --jitter <PX>           vary the point by up to +-PX pixels
+        --jitter <PX>           vary the point by up to +-PX coordinate units
+        --stop-on-move <PX>     stop when the pointer moves PX units; 0 disables it
         --button <left|right|middle>
         --delay <MS>            wait before the first click; the time limit starts afterwards
         --quiet                 print only the final summary
@@ -36,7 +37,15 @@ OTHER OPTIONS:
     -V, --version               print the version
 
 Exit status is 0 on success (including stop conditions and Ctrl+C), 1 on a
-runtime error, and 2 for invalid arguments. A second Ctrl+C exits immediately.";
+runtime error, and 2 for invalid arguments. A second Ctrl+C exits immediately.
+
+Linux requires a running desktop session. Wayland tries the virtual pointer,
+then the RemoteDesktop portal, then X11/XWayland. The portal may show a permission
+prompt; saved permission is reused when the compositor allows it. --quiet does
+not suppress permission prompts. Wayland points use logical desktop coordinates;
+X11 points use pixels. Cursor jitter and saved stop-on-move require readable
+pointer coordinates (usually XWayland). Fixed points with jitter work without
+pointer reads when stop-on-move is off.";
 
 #[derive(Debug, Default)]
 pub struct Args {
@@ -53,6 +62,7 @@ pub struct Run {
     interval_ms: Option<u32>,
     at: Option<(i32, i32)>,
     jitter_px: Option<u32>,
+    stop_on_move_px: Option<u32>,
     button: Option<MouseButton>,
     delay_ms: Option<u32>,
     quiet: bool,
@@ -72,6 +82,16 @@ pub fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             None => (arg.clone(), None),
         };
         index += 1;
+        if inline.is_some()
+            && matches!(
+                name.as_str(),
+                "-h" | "--help" | "-V" | "--version" | "--headless" | "--quiet"
+            )
+        {
+            return Err(format!(
+                "{name} does not take a value\nUse --help for usage."
+            ));
+        }
 
         // Pulls the value from `--flag=value` or the following argument.
         macro_rules! value {
@@ -79,10 +99,9 @@ pub fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 match inline.clone() {
                     Some(value) => value,
                     None => {
-                        let value = args
-                            .get(index)
-                            .cloned()
-                            .ok_or_else(|| format!("{name} needs a value\n\n{USAGE}"))?;
+                        let value = args.get(index).cloned().ok_or_else(|| {
+                            format!("{name} needs a value\nUse --help for usage.")
+                        })?;
                         index += 1;
                         value
                     }
@@ -114,15 +133,19 @@ pub fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 run.delay_ms = Some(number(&value!(), &name)?);
                 seen_run_flag = true;
             }
+            "--stop-on-move" => {
+                run.stop_on_move_px = Some(number(&value!(), &name)?);
+                seen_run_flag = true;
+            }
             "--jitter" => {
                 run.jitter_px = Some(number(&value!(), &name)?);
                 seen_run_flag = true;
             }
             "--at" => {
                 let raw = value!();
-                let (x, y) = raw
-                    .split_once(',')
-                    .ok_or_else(|| format!("{name} wants X,Y but got {raw}\n\n{USAGE}"))?;
+                let (x, y) = raw.split_once(',').ok_or_else(|| {
+                    format!("{name} wants X,Y but got {raw}\nUse --help for usage.")
+                })?;
                 run.at = Some((number(x.trim(), &name)?, number(y.trim(), &name)?));
                 seen_run_flag = true;
             }
@@ -132,14 +155,12 @@ pub fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
                     "left" | "l" => MouseButton::Left,
                     "right" | "r" => MouseButton::Right,
                     "middle" | "m" => MouseButton::Middle,
-                    other => return Err(format!("unknown button: {other}\n\n{USAGE}")),
+                    other => return Err(format!("unknown button: {other}\nUse --help for usage.")),
                 });
                 seen_run_flag = true;
             }
             other => {
-                return Err(format!(
-                    "unknown option: {other}. Note that arguments are not passed to the GUI.\n\n{USAGE}"
-                ));
+                return Err(format!("unknown option: {other}\nUse --help for usage."));
             }
         }
     }
@@ -153,7 +174,7 @@ pub fn parse(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
 fn number<T: std::str::FromStr>(raw: &str, flag: &str) -> Result<T, String> {
     raw.trim()
         .parse()
-        .map_err(|_| format!("{flag} wants a number but got {raw}\n\n{USAGE}"))
+        .map_err(|_| format!("{flag} wants a number but got {raw}\nUse --help for usage."))
 }
 
 impl Run {
@@ -188,6 +209,9 @@ impl Run {
             settings.jitter_x = px;
             settings.jitter_y = px;
         }
+        if let Some(px) = self.stop_on_move_px {
+            settings.stop_on_move_px = px;
+        }
         if let Some(button) = self.button {
             settings.button = button;
         }
@@ -207,7 +231,7 @@ impl Run {
         }
         let settings = settings_from(outcome, &self);
 
-        let mut enigo = match engine::connect() {
+        let mut enigo = match crate::input::connect_headless() {
             Ok(enigo) => enigo,
             Err(err) => {
                 eprintln!("featherclick: {err}");
@@ -255,6 +279,11 @@ impl Run {
         } else {
             0.0
         };
+        #[cfg(target_os = "linux")]
+        if let StopReason::Error(error) = &reason {
+            eprintln!("featherclick: {error}");
+            return 1;
+        }
         println!(
             "{clicks} clicks in {elapsed:.2}s ({rate:.1}/s) - {}",
             reason.describe()
@@ -437,6 +466,50 @@ mod tests {
         assert_eq!(settings.max_seconds, 30);
         assert_eq!(settings.max_clicks, 0);
         assert_eq!(settings.interval_ms, 1, "a run uses the clamped interval");
+    }
+
+    #[test]
+    fn fixed_jitter_can_disable_saved_pointer_tracking() {
+        let saved = Settings {
+            stop_on_move_px: 10,
+            ..Settings::default()
+        };
+        let settings = applied(&saved, &["--at=-100,20", "--jitter=5", "--stop-on-move=0"]);
+        assert_eq!(settings.position, PositionMode::Fixed);
+        assert_eq!(settings.point, (-100, 20));
+        assert_eq!(settings.jitter, JitterMode::Rectangle);
+        assert_eq!(settings.stop_on_move_px, 0);
+        assert_eq!(
+            applied(&saved, &["--stop-on-move", "15"]).stop_on_move_px,
+            15
+        );
+    }
+
+    #[test]
+    fn switches_reject_values_and_errors_stay_short() {
+        for flag in ["--headless", "--quiet", "--help", "--version", "-h", "-V"] {
+            let error = parse_args(&[&format!("{flag}=false")]).unwrap_err();
+            assert!(error.contains("does not take a value"));
+            assert!(!error.contains("RUN OPTIONS:"));
+        }
+        for args in [
+            vec!["--interval"],
+            vec!["--seconds", "-1"],
+            vec!["--at", "1,2,3"],
+            vec!["--unknown"],
+        ] {
+            let error = parse_args(&args).unwrap_err();
+            assert!(error.contains("--help"));
+            assert!(!error.contains("RUN OPTIONS:"));
+        }
+    }
+
+    #[test]
+    fn informational_options_do_not_start_a_run() {
+        assert!(parse_args(&[]).unwrap().run.is_none());
+        assert!(parse_args(&["--help"]).unwrap().help);
+        assert!(parse_args(&["--version"]).unwrap().version);
+        assert!(parse_args(&["--quiet"]).unwrap().run.is_some());
     }
 
     #[test]
