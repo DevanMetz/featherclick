@@ -29,7 +29,7 @@ equivalent is named in the note.
 | Window icon | working | working | partial | `src/icon.rs`, `src/main.rs`, `src/wayland_icon.rs`, `assets/featherclick.desktop` |
 | Window startup | working | working — checks X11 keyboard libraries after Wayland fallback | working — probes the connection before selecting Wayland | `src/main.rs`, `src/xkb_check.rs` |
 | Saved settings | working | working | working | `src/config.rs` |
-| Headless mode | working | working | partial | `src/cli.rs`, `src/engine.rs` |
+| Headless mode | working | working | partial — desktop session and compositor permission required; pointer reads may require XWayland | `src/cli.rs`, `src/input.rs`, `src/portal.rs`, `src/engine.rs` |
 | Screen coordinates | working | working | not possible | `src/platform.rs` |
 
 ## Clicking and fixed points
@@ -106,3 +106,18 @@ that logical point.
 
 
 GNOME and KDE use the RemoteDesktop portal when no virtual pointer is available. Permission is requested when a run starts and the restore token is saved with mode 0600. A missing or refused portal falls back to XWayland. Portal clicks use the stream’s logical layout, including negative monitor origins. Picking reads through X11 when available, otherwise uses the native Wayland overlay without opening a portal session.
+
+## Headless mode
+
+CLI runs open no FeatherClick window. On Wayland they try the virtual pointer,
+then the RemoteDesktop portal with an empty parent window, then X11/XWayland,
+keeping only the first successful input backend. The portal shares the GUI's
+private restore token; the compositor decides whether permission can be restored
+without a prompt. `--quiet` cannot hide a compositor permission dialog.
+Fixed points (including jitter) use logical desktop coordinates without pointer
+reads when stop-on-move is off (`--stop-on-move 0` overrides saved tracking). Cursor jitter and stop-on-move still need
+readable pointer coordinates, usually through XWayland; unavailable reads fail
+the run rather than silently dropping the setting. No working backend or a
+runtime failure exits 1; invalid arguments exit 2 with a short error. Live
+Wayland compositor behavior has not been verified, so parity remains partial.
+
