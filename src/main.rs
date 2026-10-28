@@ -68,10 +68,13 @@ fn main() -> ExitCode {
 
 fn gui() -> ExitCode {
     #[cfg(target_os = "linux")]
-    if let Err(message) = xkb_check::check() {
-        eprintln!("featherclick: {message}");
-        return ExitCode::FAILURE;
-    }
+    let backend = match xkb_check::check() {
+        Ok(backend) => backend,
+        Err(message) => {
+            eprintln!("featherclick: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let loaded = config::load_outcome();
     if let Some(error) = &loaded.error {
@@ -81,6 +84,17 @@ fn gui() -> ExitCode {
         eprintln!("featherclick: {error}");
     }
     let options = eframe::NativeOptions {
+        #[cfg(target_os = "linux")]
+        event_loop_builder: Some(Box::new(move |builder| match backend {
+            xkb_check::Backend::X11 => {
+                use winit::platform::x11::EventLoopBuilderExtX11;
+                builder.with_x11();
+            }
+            xkb_check::Backend::Wayland => {
+                use winit::platform::wayland::EventLoopBuilderExtWayland;
+                builder.with_wayland();
+            }
+        })),
         viewport: egui::ViewportBuilder::default()
             .with_title("FeatherClick")
             .with_app_id("featherclick")
