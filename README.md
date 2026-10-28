@@ -4,7 +4,7 @@
 
 A tiny cross-platform autoclicker with human-like timing.
 
-Single binary, no runtime dependencies, no background services.
+Single binary, no background services.
 
 </div>
 
@@ -49,6 +49,10 @@ Privacy & Security → Accessibility**, and enable FeatherClick. Without it the
 clicks are silently dropped by the system.
 
 ### First run on Linux
+
+The GUI needs `libxkbcommon` and, for X11, `libxkbcommon-x11`. Install
+`libxkbcommon0` and `libxkbcommon-x11-0` on Debian/Ubuntu, or
+`libxkbcommon` and `libxkbcommon-x11` on Fedora and Arch.
 
 ```sh
 tar -xzf featherclick-*-linux-x86_64.tar.gz

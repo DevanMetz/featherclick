@@ -23,6 +23,8 @@ mod wayland_probe;
 
 #[cfg(target_os = "linux")]
 mod wayland_pointer;
+#[cfg(target_os = "linux")]
+mod xkb_check;
 
 use std::process::ExitCode;
 
@@ -65,6 +67,12 @@ fn main() -> ExitCode {
 }
 
 fn gui() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if let Err(message) = xkb_check::check() {
+        eprintln!("featherclick: {message}");
+        return ExitCode::FAILURE;
+    }
+
     let loaded = config::load_outcome();
     if let Some(error) = &loaded.error {
         // Release Windows builds have no console until this. Attach first so
