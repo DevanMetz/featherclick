@@ -63,7 +63,13 @@ impl StopReason {
 /// Progress reported by a running session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
-    Started,
+    /// The run is armed. `arm_until` is when the first click is allowed;
+    /// `None` means there is no start delay.
+    Started {
+        arm_until: Option<Instant>,
+    },
+    /// The start delay is over. The time limit runs from here.
+    Clicking,
     /// Total clicks sent so far.
     Trigger(u64),
     Captured((i32, i32)),
@@ -76,7 +82,12 @@ pub enum SessionEvent {
 pub struct Status {
     pub running: bool,
     pub clicks: u64,
+    /// When the run was armed, including the start delay.
     pub started: Option<Instant>,
+    /// When the start delay ends. `None` when there is nothing to wait out.
+    pub arm_until: Option<Instant>,
+    /// When clicking, and the time limit, actually began.
+    pub clicking: Option<Instant>,
     /// Set when the session ends, so the reported duration stops with it.
     pub stopped: Option<Instant>,
     pub stop_reason: Option<StopReason>,
@@ -88,13 +99,16 @@ pub struct Status {
 }
 
 impl Status {
-    /// How long the current session has been running, or how long the last one
-    /// ran for.
+    /// How long clicking has been going, or how long the last run clicked for.
+    ///
+    /// The start delay is not included once clicking has begun, so this lines
+    /// up with the time limit. A run that was stopped during the delay reports
+    /// the time spent waiting instead.
     pub fn elapsed(&self) -> Option<Duration> {
-        match (self.started, self.stopped) {
-            (Some(start), Some(end)) => Some(end.saturating_duration_since(start)),
-            (Some(start), None) => Some(start.elapsed()),
-            _ => None,
+        let origin = self.clicking.or(self.started)?;
+        match self.stopped {
+            Some(end) => Some(end.saturating_duration_since(origin)),
+            None => Some(origin.elapsed()),
         }
     }
 }
@@ -120,13 +134,18 @@ pub struct Worker {
 impl Worker {
     /// Spawns the long-lived engine thread. It owns the platform input handle
     /// for the process lifetime and idles on the command channel when stopped.
-    pub fn spawn() -> Self {
+    ///
+    /// `wake` runs on that thread when the run starts, stops, or a point is
+    /// picked. Click counts are left to the window's own timer: waking on
+    /// every click would repaint hundreds of times a second.
+    pub fn spawn(wake: impl Fn() + Send + Sync + 'static) -> Self {
         let (tx, rx) = channel();
         let status: Arc<Mutex<Status>> = Arc::new(Mutex::new(Status::default()));
         let thread_status = Arc::clone(&status);
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
         let builder = thread::Builder::new().name("featherclick-engine".to_string());
         let spawned: std::io::Result<JoinHandle<()>> =
-            builder.spawn(move || worker_loop(&rx, &thread_status));
+            builder.spawn(move || worker_loop(&rx, &thread_status, wake.as_ref()));
         if let Err(err) = spawned {
             let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
             guard.error = Some(format!("cannot start engine thread: {err}"));
@@ -244,23 +263,31 @@ pub fn connect() -> Result<Enigo, String> {
 fn ensure_input<'a>(
     enigo: &'a mut Option<Enigo>,
     status: &Arc<Mutex<Status>>,
+    wake: &(dyn Fn() + Send + Sync),
 ) -> Option<&'a mut Enigo> {
     if enigo.is_none() {
         match connect() {
             Ok(handle) => *enigo = Some(handle),
             Err(err) => {
-                status.lock().unwrap_or_else(|e| e.into_inner()).error = Some(err);
+                note_error(status, wake, err);
             }
         }
     }
     enigo.as_mut()
 }
 
-fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
+fn worker_loop(
+    rx: &Receiver<Command>,
+    status: &Arc<Mutex<Status>>,
+    wake: &(dyn Fn() + Send + Sync),
+) {
     let mut enigo = match connect() {
         Ok(enigo) => Some(enigo),
         Err(err) => {
-            status.lock().unwrap_or_else(|e| e.into_inner()).error = Some(err);
+            // One attempt. A second connection here used to be only for the
+            // message, and a success on that retry left the thread with neither
+            // a handle nor an error.
+            note_error(status, wake, err);
             None
         }
     };
@@ -273,8 +300,8 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
             Ok(Command::Stop) => {}
             Ok(Command::Capture) => {
                 // Retry the connection: a display may have appeared since launch.
-                if let Some(handle) = ensure_input(&mut enigo, status) {
-                    capture(handle, &mut |event| apply(status, event));
+                if let Some(handle) = ensure_input(&mut enigo, status, wake) {
+                    capture(handle, &mut |event| apply(status, event, wake));
                 }
             }
             Ok(Command::Start(settings)) | Ok(Command::Toggle(settings)) => {
@@ -282,12 +309,12 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
                 if !idle {
                     continue;
                 }
-                if let Some(handle) = ensure_input(&mut enigo, status) {
+                if let Some(handle) = ensure_input(&mut enigo, status, wake) {
                     run_session(
                         &settings,
                         rx,
                         handle,
-                        &mut |event| apply(status, event),
+                        &mut |event| apply(status, event, wake),
                         &|| false,
                     );
                 }
@@ -296,30 +323,44 @@ fn worker_loop(rx: &Receiver<Command>, status: &Arc<Mutex<Status>>) {
     }
 }
 
+fn note_error(status: &Mutex<Status>, wake: &(dyn Fn() + Send + Sync), message: String) {
+    status.lock().unwrap_or_else(|e| e.into_inner()).error = Some(message);
+    wake();
+}
+
 /// Applies a session event to the shared status. Kept out of `Worker` so the
 /// worker thread can use it without cloning the handle.
-fn apply(status: &Arc<Mutex<Status>>, event: SessionEvent) {
-    let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
-    match event {
-        SessionEvent::Started => {
-            guard.running = true;
-            guard.clicks = 0;
-            guard.started = Some(Instant::now());
-            guard.stopped = None;
-            guard.stop_reason = None;
-            guard.error = None;
+fn apply(status: &Arc<Mutex<Status>>, event: SessionEvent, wake: &(dyn Fn() + Send + Sync)) {
+    let notify = !matches!(event, SessionEvent::Trigger(_));
+    {
+        let mut guard = status.lock().unwrap_or_else(|e| e.into_inner());
+        match event {
+            SessionEvent::Started { arm_until } => {
+                guard.running = true;
+                guard.clicks = 0;
+                guard.started = Some(Instant::now());
+                guard.arm_until = arm_until;
+                guard.clicking = None;
+                guard.stopped = None;
+                guard.stop_reason = None;
+                guard.error = None;
+            }
+            SessionEvent::Clicking => guard.clicking = Some(Instant::now()),
+            SessionEvent::Trigger(clicks) => guard.clicks = clicks,
+            SessionEvent::Captured(point) => {
+                guard.captured = Some(point);
+                guard.capture_seq = guard.capture_seq.wrapping_add(1);
+            }
+            SessionEvent::Warning(err) => guard.error = Some(err),
+            SessionEvent::Stopped(reason) => {
+                guard.running = false;
+                guard.stopped = Some(Instant::now());
+                guard.stop_reason = Some(reason);
+            }
         }
-        SessionEvent::Trigger(clicks) => guard.clicks = clicks,
-        SessionEvent::Captured(point) => {
-            guard.captured = Some(point);
-            guard.capture_seq = guard.capture_seq.wrapping_add(1);
-        }
-        SessionEvent::Warning(err) => guard.error = Some(err),
-        SessionEvent::Stopped(reason) => {
-            guard.running = false;
-            guard.stopped = Some(Instant::now());
-            guard.stop_reason = Some(reason);
-        }
+    }
+    if notify {
+        wake();
     }
 }
 
@@ -364,6 +405,11 @@ fn time_limit_reached(settings: &Settings, elapsed: Duration) -> bool {
 
 /// True when this run moves the pointer itself. Stop-on-move then watches the
 /// point we left it on, rather than the position from when the run began.
+fn time_limit_due(settings: &Settings, clicking_from: Option<Instant>, now: Instant) -> bool {
+    clicking_from
+        .is_some_and(|from| time_limit_reached(settings, now.saturating_duration_since(from)))
+}
+
 fn places_pointer(settings: &Settings) -> bool {
     settings.position == PositionMode::Fixed || settings.jitter != JitterMode::Off
 }
@@ -545,7 +591,7 @@ struct ClickOutcome {
 /// while the abort check borrows the session.
 struct Run<'a, M: Pointer> {
     settings: &'a Settings,
-    started: Instant,
+    clicking_from: Option<Instant>,
     /// Where the pointer is allowed to rest. `None` until we have a reference:
     /// the anchor when we never move it, the last placed point when we do.
     parked: Option<(i32, i32)>,
@@ -568,7 +614,7 @@ impl<M: Pointer> Run<'_, M> {
         if (self.interrupt)() {
             return Some(StopReason::User);
         }
-        if time_limit_reached(self.settings, self.started.elapsed()) {
+        if time_limit_due(self.settings, self.clicking_from, Instant::now()) {
             return Some(StopReason::TimeLimit);
         }
         if let Some(parked) = self.parked {
@@ -656,13 +702,14 @@ pub(crate) fn run_session(
     interrupt: &dyn Fn() -> bool,
 ) {
     let _timer = crate::platform::TimerResolution::acquire();
-    sink(SessionEvent::Started);
-
     let started = Instant::now();
+    let arm_until = (settings.start_delay_ms > 0)
+        .then(|| started + Duration::from_millis(u64::from(settings.start_delay_ms)));
+    sink(SessionEvent::Started { arm_until });
     let mut waiter = Waiter::new();
     let mut run = Run {
         settings,
-        started,
+        clicking_from: None,
         parked: None,
         rx,
         enigo,
@@ -679,6 +726,9 @@ pub(crate) fn run_session(
             return;
         }
     }
+
+    run.clicking_from = Some(Instant::now());
+    (run.sink)(SessionEvent::Clicking);
 
     let read = if anchor_needs_pointer(settings) {
         run.enigo.read_pointer()
@@ -917,6 +967,8 @@ impl Waiter {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread;
 
     use enigo::{Axis, InputError, Mouse};
 
@@ -1113,6 +1165,172 @@ mod tests {
         assert!(!time_limit_reached(&s, Duration::from_millis(1_999)));
         assert!(time_limit_reached(&s, Duration::from_secs(2)));
         assert!(time_limit_reached(&s, Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn the_time_limit_does_not_run_before_clicking_starts() {
+        let mut s = settings();
+        s.max_seconds = 1;
+        let now = Instant::now();
+        assert!(
+            !time_limit_due(&s, None, now + Duration::from_secs(3_600)),
+            "the arming delay is not clicking time"
+        );
+        assert!(!time_limit_due(
+            &s,
+            Some(now),
+            now + Duration::from_millis(999)
+        ));
+        assert!(time_limit_due(&s, Some(now), now + Duration::from_secs(1)));
+
+        s.max_seconds = 0;
+        assert!(!time_limit_due(
+            &s,
+            Some(now),
+            now + Duration::from_secs(3_600)
+        ));
+    }
+
+    #[test]
+    fn the_reported_duration_starts_when_clicking_does() {
+        let started = Instant::now();
+        let clicking = started + Duration::from_millis(1_500);
+        let finished = Status {
+            started: Some(started),
+            clicking: Some(clicking),
+            stopped: Some(clicking + Duration::from_millis(1_000)),
+            ..Status::default()
+        };
+        assert_eq!(finished.elapsed(), Some(Duration::from_millis(1_000)));
+
+        let interrupted = Status {
+            started: Some(started),
+            stopped: Some(started + Duration::from_millis(400)),
+            ..Status::default()
+        };
+        assert_eq!(
+            interrupted.elapsed(),
+            Some(Duration::from_millis(400)),
+            "stopping during the delay reports the wait, not nothing"
+        );
+    }
+
+    /// Clicks on the real pointer. Ignored so `cargo test` on a desktop does
+    /// not move it; CI runs these under Xvfb.
+    fn session_settings() -> Settings {
+        let mut s = settings();
+        s.timing = TimingMode::Fixed;
+        s.interval_ms = 40;
+        s.position = PositionMode::Fixed;
+        s.point = (24, 24);
+        s.jitter = JitterMode::Off;
+        s.style = ClickStyle::Single;
+        s
+    }
+
+    fn run_for(settings: &Settings, rx: &Receiver<Command>) -> Vec<SessionEvent> {
+        let mut enigo = connect().expect("Xvfb should accept an X11 connection");
+        let mut events = Vec::new();
+        run_session(
+            settings,
+            rx,
+            &mut enigo,
+            &mut |event| events.push(event),
+            &|| false,
+        );
+        events
+    }
+
+    #[test]
+    #[ignore = "clicks; run under xvfb"]
+    fn a_time_limit_shorter_than_the_start_delay_still_clicks() {
+        let mut s = session_settings();
+        // Longer than the limit on purpose: counting the delay against the
+        // limit used to stop the run before the first click.
+        s.start_delay_ms = 1_200;
+        s.max_seconds = 1;
+        s.max_clicks = 80;
+
+        let (_tx, rx) = mpsc::channel();
+        let start = Instant::now();
+        let events = run_for(&s, &rx);
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(
+                events.first(),
+                Some(SessionEvent::Started { arm_until: Some(_) })
+            ),
+            "the window needs the delay deadline, got {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::Clicking)),
+            "clicking never started: {events:?}"
+        );
+        let clicks = events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                SessionEvent::Trigger(n) => Some(*n),
+                _ => None,
+            })
+            .unwrap_or(0);
+        assert!(
+            clicks >= 8,
+            "the delay consumed the time limit ({clicks} clicks) in {elapsed:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| { matches!(event, SessionEvent::Stopped(StopReason::TimeLimit)) }),
+            "{events:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(2_000),
+            "finished before the delay plus the time limit: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(4_000),
+            "ran past the delay plus the time limit: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "clicks; run under xvfb"]
+    fn a_stop_during_the_start_delay_clicks_nothing() {
+        let mut s = session_settings();
+        s.start_delay_ms = 3_000;
+        s.max_seconds = 30;
+        s.max_clicks = 20;
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let _ = tx.send(Command::Stop);
+        });
+
+        let start = Instant::now();
+        let events = run_for(&s, &rx);
+        let elapsed = start.elapsed();
+
+        assert!(
+            events.iter().all(|event| {
+                !matches!(event, SessionEvent::Clicking | SessionEvent::Trigger(_))
+            }),
+            "a stop during the delay must not click: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::Stopped(StopReason::User))),
+            "{events:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_000),
+            "stop waited out the delay: {elapsed:?}"
+        );
     }
 
     #[test]

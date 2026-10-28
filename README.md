@@ -127,14 +127,15 @@ featherclick --headless --clicks 100
 | `--at <X,Y>` | Click a fixed screen point. |
 | `--jitter <PX>` | Randomise the point by up to ±PX pixels. |
 | `--button <left\|right\|middle>` | Which button to click. |
-| `--delay <MS>` | Wait before the first click. |
+| `--delay <MS>` | Wait before the first click. The time limit starts afterwards. |
 | `--quiet` | Print only the final summary. |
 | `--help`, `--version` | Usage and version. |
 
 Style, jitter shape, stop-on-move and the other options come from the saved
 settings. Passing `--clicks` or `--seconds` replaces both saved limits, so
 `--seconds 30` runs for 30 seconds even if the config also has a click cap, and
-`--clicks 20` is not cut short by a saved time limit.
+`--clicks 20` is not cut short by a saved time limit. A start delay finishes
+before that time limit starts, so `--delay 2000 --seconds 1` still clicks.
 
 Exit status is `0` for a normal stop — including limits and Ctrl+C — `1` if the
 input backend could not be reached or failed during a run, and `2` for invalid
