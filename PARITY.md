@@ -27,6 +27,7 @@ equivalent is named in the note.
 | Dark / light theme | working | working | working | `src/ui.rs` |
 | Always on top | working | working | not possible | `src/ui.rs` |
 | Window icon | working | working | partial | `src/icon.rs`, `src/main.rs`, `src/wayland_icon.rs`, `assets/featherclick.desktop` |
+| Window startup | working | working — checks X11 keyboard libraries after Wayland fallback | working — probes the connection before selecting Wayland | `src/main.rs`, `src/xkb_check.rs` |
 | Saved settings | working | working | working | `src/config.rs` |
 | Headless mode | working | working | partial | `src/cli.rs`, `src/engine.rs` |
 | Screen coordinates | working | working | not possible | `src/platform.rs` |
