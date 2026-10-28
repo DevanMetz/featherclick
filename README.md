@@ -11,7 +11,7 @@ Single binary, no runtime dependencies, no background services.
 ## Features
 
 - **Human-like timing** — fixed interval, uniform random between a min and max, or
-  Gaussian (mean and sigma), all in milliseconds.
+  Gaussian (mean and sigma, within ±4 sigma), all in milliseconds.
 - **Random pixels in a range** — every click can land anywhere in a box, an
   ellipse, or a Gaussian spread around the target.
 - **Limits that stop it for you** — stop after *N* clicks, after *S* seconds, or

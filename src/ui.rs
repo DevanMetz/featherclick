@@ -403,13 +403,7 @@ impl App {
                         .suffix(" ms"),
                 );
             });
-            let (low, high) = self.settings.rate_range();
-            let rate = if (high - low).abs() < 0.05 {
-                format!("{low:.1} clicks/s")
-            } else {
-                format!("{low:.1} – {high:.1} clicks/s")
-            };
-            hint(ui, &rate);
+            hint(ui, &rate_text(&self.settings));
         });
     }
 
@@ -680,6 +674,24 @@ fn row(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
     });
 }
 
+/// Rate line under the timing controls.
+///
+/// Uniform and fixed modes show the interval bounds. A Gaussian is shown at
+/// its mean: the ±4 sigma window is a clamp, and with the default sigma it
+/// runs down to the 1 ms floor, which would read as 1000 clicks/s.
+fn rate_text(settings: &Settings) -> String {
+    if settings.timing == TimingMode::Normal {
+        let mean = (settings.interval_mean_ms as f64).max(1.0);
+        return format!("{:.1} clicks/s", 1000.0 / mean);
+    }
+    let (low, high) = settings.rate_range();
+    if (high - low).abs() < 0.05 {
+        format!("{low:.1} clicks/s")
+    } else {
+        format!("{low:.1} – {high:.1} clicks/s")
+    }
+}
+
 fn hint(ui: &mut Ui, text: &str) {
     ui.add_space(2.0);
     ui.label(
@@ -918,4 +930,45 @@ fn key_to_code(key: egui::Key) -> Option<Code> {
         K::CloseBracket => Code::BracketRight,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_line_uses_the_mean_for_human_like_timing() {
+        let mut settings = Settings {
+            timing: TimingMode::Normal,
+            interval_mean_ms: 100,
+            interval_std_ms: 25,
+            ..Settings::default()
+        };
+        assert_eq!(
+            rate_text(&settings),
+            "10.0 clicks/s",
+            "the default sigma reaches the 1 ms floor, which is not the pace"
+        );
+
+        settings.interval_mean_ms = 80;
+        assert_eq!(rate_text(&settings), "12.5 clicks/s");
+
+        settings.interval_mean_ms = 0;
+        assert_eq!(rate_text(&settings), "1000.0 clicks/s");
+    }
+
+    #[test]
+    fn rate_line_keeps_fixed_and_uniform_bounds() {
+        let mut settings = Settings {
+            timing: TimingMode::Fixed,
+            interval_ms: 100,
+            ..Settings::default()
+        };
+        assert_eq!(rate_text(&settings), "10.0 clicks/s");
+
+        settings.timing = TimingMode::Uniform;
+        settings.interval_min_ms = 40;
+        settings.interval_max_ms = 120;
+        assert_eq!(rate_text(&settings), "8.3 – 25.0 clicks/s");
+    }
 }
