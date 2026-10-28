@@ -47,6 +47,7 @@ fn enigo() -> Result<Input, String> {
         // Every extra millisecond of per-event delay is a millisecond off the
         // achievable click rate.
         linux_delay: 0,
+        wayland_display: Some("featherclick-no-display".into()),
         ..EnigoSettings::default()
     };
     Enigo::new(&settings)
@@ -131,5 +132,26 @@ mod tests {
                 "the pointer did not land on the requested pixel"
             );
         }
+    }
+}
+
+impl enigo::Mouse for Input {
+    fn button(&mut self, button: Button, direction: Direction) -> enigo::InputResult<()> {
+        Input::button(self, button, direction).map_err(enigo::InputError::Mapping)
+    }
+    fn move_mouse(&mut self, x: i32, y: i32, coordinate: Coordinate) -> enigo::InputResult<()> {
+        if coordinate != Coordinate::Abs {
+            return Err(enigo::InputError::InvalidInput("relative move unsupported"));
+        }
+        self.move_abs(x, y).map_err(enigo::InputError::Mapping)
+    }
+    fn scroll(&mut self, _: i32, _: enigo::Axis) -> enigo::InputResult<()> {
+        Err(enigo::InputError::InvalidInput("scroll unsupported"))
+    }
+    fn main_display(&self) -> enigo::InputResult<(i32, i32)> {
+        Err(enigo::InputError::InvalidInput("display size unavailable"))
+    }
+    fn location(&self) -> enigo::InputResult<(i32, i32)> {
+        Input::location(self).map_err(enigo::InputError::Mapping)
     }
 }
