@@ -245,7 +245,7 @@ cargo test
 Linux needs the usual winit build dependencies:
 
 ```sh
-sudo apt install pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+sudo apt install pkg-config libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev libx11-dev \
   libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
 ```
 
