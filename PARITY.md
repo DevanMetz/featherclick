@@ -27,7 +27,7 @@ equivalent is named in the note.
 | Dark / light theme | working | working | working | `src/ui.rs` |
 | Always on top | working | working | not possible | `src/ui.rs` |
 | Window icon | working | working | partial | `src/icon.rs`, `src/main.rs`, `src/wayland_icon.rs`, `assets/featherclick.desktop` |
-| Saved settings | working — atomic saves, corrupt-file backup and defaults | working — same recovery and value clamping | working — same recovery and value clamping | `src/config.rs` |
+| Saved settings | working — atomic saves with unique temp files, corrupt-file backup and defaults | working — same recovery and value clamping | working — same recovery and value clamping | `src/config.rs` |
 | Headless mode | working | working | partial | `src/cli.rs`, `src/engine.rs` |
 | Screen coordinates | working | working | not possible | `src/platform.rs` |
 

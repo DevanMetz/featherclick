@@ -350,7 +350,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    let mut tmp = temp_path(path);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -358,22 +357,25 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    // Never truncate a pre-existing temp file or follow a symlink.
-    let mut file = loop {
+    // Start with a unique sibling on every save, including after a restart.
+    // create_new prevents truncating a stale file or following a symlink.
+    let (tmp, mut file) = loop {
+        let tmp = sibling(
+            path,
+            &format!(
+                ".{}.{:032x}.tmp",
+                std::process::id(),
+                rand::random::<u128>()
+            ),
+        );
         match options.open(&tmp) {
-            Ok(file) => break file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                use std::sync::atomic::{AtomicU64, Ordering};
-                static NEXT: AtomicU64 = AtomicU64::new(0);
-                tmp = sibling(
-                    path,
-                    &format!(
-                        ".{}.{}.tmp",
-                        std::process::id(),
-                        NEXT.fetch_add(1, Ordering::Relaxed)
-                    ),
-                );
-            }
+            Ok(file) => break (tmp, file),
+            // Windows can report PermissionDenied for an existing directory.
+            // Retry only collisions; real access errors must reach the caller.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    || (error.kind() == std::io::ErrorKind::PermissionDenied
+                        && std::fs::symlink_metadata(&tmp).is_ok()) => {}
             Err(error) => return Err(error),
         }
     };
@@ -387,6 +389,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }
+    // Rust uses replacement semantics on Windows too. Do not remove the old
+    // file first: a failed replacement must preserve the previous settings.
     if let Err(err) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
@@ -396,10 +400,6 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 fn backup_path(path: &Path) -> PathBuf {
     sibling(path, ".bak")
-}
-
-fn temp_path(path: &Path) -> PathBuf {
-    sibling(path, ".tmp")
 }
 
 fn sibling(path: &Path, suffix: &str) -> PathBuf {
@@ -555,7 +555,10 @@ mod tests {
 
         write_at(&path, &settings, false).unwrap();
 
-        assert!(!temp_path(&path).exists(), "temp file left behind");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
         assert!(!backup_path(&path).exists());
         let outcome = read_at(&path);
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
@@ -577,7 +580,7 @@ mod tests {
 
         assert_eq!(std::fs::read(backup_path(&path)).unwrap(), raw);
         assert!(read_at(&path).error.is_none());
-        assert!(!temp_path(&path).exists());
+        assert_eq!(std::fs::read_dir(&dir.path).unwrap().count(), 2);
     }
 
     #[test]
@@ -591,7 +594,7 @@ mod tests {
 
         let err = write_at(&path, &Settings::default(), true).unwrap_err();
         assert_eq!(std::fs::read(&path).unwrap(), raw, "{err}");
-        assert!(!temp_path(&path).exists());
+        assert_eq!(std::fs::read_dir(&dir.path).unwrap().count(), 2);
     }
 
     #[test]
@@ -600,12 +603,35 @@ mod tests {
         let path = dir.path.join("config.json");
         let raw = b"{not json\n";
         std::fs::write(&path, raw).unwrap();
-        std::fs::create_dir(temp_path(&path)).unwrap();
+        std::fs::create_dir(sibling(&path, ".tmp")).unwrap();
 
         write_at(&path, &Settings::default(), true).unwrap();
         assert!(read_at(&path).error.is_none());
-        assert!(temp_path(&path).is_dir(), "existing temp path is untouched");
+        assert!(
+            sibling(&path, ".tmp").is_dir(),
+            "existing temp path is untouched"
+        );
         assert_eq!(std::fs::read(backup_path(&path)).unwrap(), raw);
+        assert_eq!(std::fs::read_dir(&dir.path).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn repeated_saves_replace_settings_and_backups_without_leaking_temps() {
+        let dir = Scratch::new();
+        let path = dir.path.join("config.json");
+        let stale = sibling(&path, ".tmp");
+        std::fs::write(&stale, b"stale save").unwrap();
+        let mut settings = Settings::default();
+        write_at(&path, &settings, false).unwrap();
+        for interval in [123, 456, 789] {
+            let previous = std::fs::read(&path).unwrap();
+            settings.interval_ms = interval;
+            write_at(&path, &settings, true).unwrap();
+            assert_eq!(read_at(&path).settings, settings);
+            assert_eq!(std::fs::read(backup_path(&path)).unwrap(), previous);
+            assert_eq!(std::fs::read(&stale).unwrap(), b"stale save");
+            assert_eq!(std::fs::read_dir(&dir.path).unwrap().count(), 3);
+        }
     }
 
     #[test]
@@ -655,7 +681,7 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         assert!(write_at(&path, &Settings::default(), false).is_err());
         assert!(path.is_dir());
-        assert!(!temp_path(&path).exists());
+        assert_eq!(std::fs::read_dir(&dir.path).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
