@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[test]
-fn headless_exits_when_the_settings_file_does_not_parse() {
+fn headless_recovers_and_backs_up_settings_that_do_not_parse() {
     let home = scratch();
     let file = config_file(&home);
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -22,14 +22,7 @@ fn headless_exits_when_the_settings_file_does_not_parse() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_featherclick"));
     command
         .env("HOME", &home)
-        .args([
-            "--headless",
-            "--clicks",
-            "5",
-            "--interval",
-            "1000",
-            "--quiet",
-        ])
+        .args(["--headless", "--clicks", "1", "--interval", "1", "--quiet"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -42,22 +35,20 @@ fn headless_exits_when_the_settings_file_does_not_parse() {
 
     let output = output_with_timeout(&mut command, Duration::from_secs(10));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "stdout: {}\nstderr: {stderr}",
-        String::from_utf8_lossy(&output.stdout)
-    );
+    // Input availability is session-dependent; config recovery must happen
+    // whether connecting to an input backend succeeds or fails.
+    assert!(matches!(output.status.code(), Some(0 | 1)), "{stderr}");
     assert!(
         stderr.contains("cannot parse") && stderr.contains("config.json"),
         "{stderr}"
     );
-    assert!(
-        !stderr.contains("cannot simulate input"),
-        "a broken file must be rejected before any click attempt: {stderr}"
-    );
+    assert_eq!(stderr.matches("cannot parse").count(), 1, "{stderr}");
+    assert!(stderr.contains("using defaults"), "{stderr}");
     assert_eq!(std::fs::read(&file).unwrap(), raw);
-    assert!(!file.with_file_name("config.json.bak").exists());
+    assert_eq!(
+        std::fs::read(file.with_file_name("config.json.bak")).unwrap(),
+        raw
+    );
     assert!(!file.with_file_name("config.json.tmp").exists());
 
     let _ = std::fs::remove_dir_all(&home);
